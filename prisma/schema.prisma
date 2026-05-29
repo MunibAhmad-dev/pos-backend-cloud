@@ -1,0 +1,135 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Models ──────────────────────────────────────────────────────────────────
+
+model Instance {
+  id                 Int       @id @default(autoincrement())
+  instance_id        String    @unique
+  store_name         String    @default("")
+  owner_name         String    @default("")
+  owner_mobile       String
+  owner_email        String    @default("")
+  store_address      String    @default("")
+  business_name      String    @default("")
+  api_key            String    @unique
+  license_key        String    @default("")
+  license_plan       String    @default("none")
+  license_expiry     String?   // ISO string from POS — kept as text for compatibility
+  approval_status    String    @default("pending")
+  block_reason       String    @default("")
+  last_seen          DateTime?
+  app_version        String    @default("")
+  total_sales        Int       @default(0)
+  total_revenue      Float     @default(0)
+  total_customers    Int       @default(0)
+  total_products     Int       @default(0)
+  device_fingerprint String    @default("")
+  license_revoked    Int       @default(0)  // 0 | 1 — POS expects an integer
+  branch_name        String    @default("Main Branch")
+  created_at         DateTime  @default(now())
+  updated_at         DateTime  @updatedAt
+
+  sync_events        SyncEvent[]
+  instance_sales     InstanceSale[]
+  license_keys       LicenseKey[]
+  notification_reads NotificationRead[]
+
+  @@map("instances")
+  @@index([approval_status])
+  @@index([last_seen])
+}
+
+model SyncEvent {
+  id          Int      @id @default(autoincrement())
+  instance_id String
+  entity_type String
+  operation   String
+  payload     String   // raw JSON string from POS
+  received_at DateTime @default(now())
+
+  instance    Instance @relation(fields: [instance_id], references: [instance_id])
+
+  @@map("sync_events")
+  @@index([instance_id])
+  @@index([entity_type, operation])
+}
+
+model InstanceSale {
+  id             Int      @id @default(autoincrement())
+  instance_id    String
+  pos_sale_id    Int
+  total          Float    @default(0)
+  discount       Float    @default(0)
+  payment_method String   @default("cash")
+  payment_status String   @default("Paid")
+  status         String   @default("Completed")
+  items_count    Int      @default(0)
+  items_summary  String   @default("")
+  date_created   String?  // ISO string from POS — kept as text for analytics casting
+  synced_at      DateTime @default(now())
+
+  instance       Instance @relation(fields: [instance_id], references: [instance_id])
+
+  @@map("instance_sales")
+  @@unique([instance_id, pos_sale_id])
+  @@index([instance_id])
+}
+
+model AdminUser {
+  id            Int      @id @default(autoincrement())
+  username      String   @unique
+  password_hash String
+  role          String   @default("admin")
+  created_at    DateTime @default(now())
+
+  @@map("admin_users")
+}
+
+model LicenseKey {
+  id            Int      @id @default(autoincrement())
+  license_key   String   @unique
+  instance_id   String?
+  plan          String   @default("monthly")
+  duration_days Int      @default(30)
+  issued_at     DateTime @default(now())
+  expires_at    String?  // ISO string — kept as text for POS compatibility
+  is_active     Boolean  @default(true)
+  notes         String   @default("")
+
+  instance      Instance? @relation(fields: [instance_id], references: [instance_id])
+
+  @@map("license_keys")
+}
+
+model Notification {
+  id                 Int      @id @default(autoincrement())
+  title              String
+  body               String
+  target_instance_id String?
+  sent_at            DateTime @default(now())
+  is_active          Boolean  @default(true)
+
+  notification_reads NotificationRead[]
+
+  @@map("notifications")
+  @@index([target_instance_id])
+}
+
+model NotificationRead {
+  notification_id Int
+  instance_id     String
+  read_at         DateTime @default(now())
+
+  notification    Notification @relation(fields: [notification_id], references: [id])
+  instance        Instance     @relation(fields: [instance_id], references: [instance_id])
+
+  @@map("notification_reads")
+  @@id([notification_id, instance_id])
+}
