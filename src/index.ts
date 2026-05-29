@@ -16,21 +16,35 @@ import businessRoutes from './routes/businesses';   // ← add this
 const app  = express();
 const PORT = Number(process.env.PORT) || 5000;
 
-// ─── Security ────────────────────────────────────────────────────────────────
-app.use(helmet());
+// ─── CORS (must come BEFORE helmet) ──────────────────────────────────────────
+// Supports '*' in ALLOWED_ORIGINS to permit all origins (useful for Railway).
+const allowedOrigins = (
+  process.env.ALLOWED_ORIGINS ||
+  'http://localhost:3001,http://localhost:5173,https://munibahmad-dev.github.io'
+).split(',').map(o => o.trim()).filter(Boolean);
 
-// CORS — allow the admin dashboard origin(s) plus the Electron app (file://)
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3001,http://localhost:5173,https://munibahmad-dev.github.io')
-  .split(',')
-  .map(o => o.trim());
-app.use(cors({
+const corsOptions: cors.CorsOptions = {
   origin: (origin, cb) => {
-    // Allow Electron (no origin header) and listed web origins
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
-    cb(new Error(`CORS: ${origin} is not allowed`));
+    // No origin = same-origin or Electron (file://) — always allow
+    if (!origin) return cb(null, true);
+    // Wildcard in list = allow everything
+    if (allowedOrigins.includes('*')) return cb(null, true);
+    // Exact match
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+    // Reject — use null false, NOT an Error, so CORS headers are still sent
+    cb(null, false);
   },
   credentials: true,
-}));
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-setup-key'],
+};
+
+// Handle all preflight requests before any other middleware
+app.options('*', cors(corsOptions));
+app.use(cors(corsOptions));
+
+// ─── Security (after CORS so headers aren't overwritten) ─────────────────────
+app.use(helmet({ crossOriginResourcePolicy: false }));
 
 // ─── Body parsing ────────────────────────────────────────────────────────────
 app.use(express.json({ limit: '2mb' }));
