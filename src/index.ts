@@ -14,7 +14,7 @@ import businessRoutes from './routes/businesses';   // ← add this
 // Prisma client is lazily initialized on first use — no explicit bootstrap needed.
 
 const app  = express();
-const PORT = Number(process.env.PORT) || 4000;
+const PORT = Number(process.env.PORT) || 5000;
 
 // ─── Security ────────────────────────────────────────────────────────────────
 app.use(helmet());

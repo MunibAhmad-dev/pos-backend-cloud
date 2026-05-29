@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import prisma from '../db';
 import { requireAdmin, signAdminToken } from '../middleware/auth';
+import '../types'; // loads Express Request augmentation (req.admin, req.instance)
 
 const router = Router();
 

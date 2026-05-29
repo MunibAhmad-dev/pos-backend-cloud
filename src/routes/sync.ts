@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { Prisma } from '@prisma/client';
 import prisma from '../db';
 import { requireInstance } from '../middleware/instanceAuth';
+import '../types';
 
 const router = Router();
 
