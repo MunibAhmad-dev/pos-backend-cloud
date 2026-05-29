@@ -20,7 +20,7 @@ const PORT = Number(process.env.PORT) || 5000;
 app.use(helmet());
 
 // CORS — allow the admin dashboard origin(s) plus the Electron app (file://)
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3001,http://localhost:5173')
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'http://localhost:3001,http://localhost:5173,pos-backend-cloud-production.up.railway.app')
   .split(',')
   .map(o => o.trim());
 app.use(cors({
