@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import { Prisma } from '@prisma/client';
 import prisma from '../db';
 import { requireAdmin } from '../middleware/auth';
+import '../types';
 
 // ─── License keygen (same AES-256-GCM algorithm as POS client) ───────────────
 const LICENSE_SECRET = Buffer.from(
