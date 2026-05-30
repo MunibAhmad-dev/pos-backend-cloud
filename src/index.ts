@@ -20,7 +20,7 @@ const PORT = Number(process.env.PORT) || 5000;
 // Supports '*' in ALLOWED_ORIGINS to permit all origins (useful for Railway).
 const allowedOrigins = (
   process.env.ALLOWED_ORIGINS ||
-  'http://localhost:3001,http://localhost:5173,https://munibahmad-dev.github.io/pos-frontend-cloud/'
+  'http://localhost:3001,http://localhost:5173, https://munibahmad-dev.github.io/pos-frontend-cloud/'
 ).split(',').map(o => o.trim()).filter(Boolean);
 
 const corsOptions: cors.CorsOptions = {

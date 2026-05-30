@@ -3,9 +3,8 @@ generator client {
 }
 
 datasource db {
-  provider  = "postgresql"
-  url       = env("DATABASE_URL")   // pooler URL — used at runtime
-  directUrl = env("DIRECT_URL")     // direct URL — used by prisma db push / migrate
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 // ─── Models ──────────────────────────────────────────────────────────────────
