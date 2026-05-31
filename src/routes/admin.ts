@@ -409,6 +409,35 @@ router.post('/instances/:id/block', async (req: Request, res: Response) => {
   res.json({ success: true, message: `Instance ${req.params.id} blocked` });
 });
 
+// ── Mobile Access Toggle ───────────────────────────────────────────────────────
+/**
+ * POST /api/admin/instances/:id/mobile-access
+ * Body: { enabled: boolean }
+ *
+ * Enables or disables mobile app access for a store.
+ * When enabled, the POS app (using its api_key) can call
+ * POST /api/instances/mobile-token to get a long-lived mobile JWT.
+ * That JWT is saved in POS settings and shown to the store owner.
+ */
+router.post('/instances/:id/mobile-access', async (req: Request, res: Response) => {
+  const { enabled } = req.body as { enabled: boolean };
+  const inst = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
+  if (!inst) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  await prisma.instance.update({
+    where: { instance_id: req.params.id },
+    data:  { mobile_access: !!enabled },
+  });
+
+  res.json({
+    success: true,
+    mobile_access: !!enabled,
+    message: enabled
+      ? 'Mobile access enabled. The store owner can now get a mobile token from their POS app.'
+      : 'Mobile access disabled. Existing mobile tokens will be rejected.',
+  });
+});
+
 // ── Instance sales ─────────────────────────────────────────────────────────────
 router.get('/instances/:id/sales', async (req: Request, res: Response) => {
   const { limit = '500', offset = '0', date_from, date_to } = req.query as Record<string, string>;
@@ -1040,6 +1069,75 @@ router.post('/seed-demo', async (_req: Request, res: Response) => {
     console.error('[seed-demo]', err);
     res.status(500).json({ success: false, error: err.message });
   }
+});
+
+// ─── App Releases (Software Update) ─────────────────────────────────────────
+
+/**
+ * GET /api/admin/releases
+ * All releases, newest first.
+ */
+router.get('/releases', async (_req: Request, res: Response) => {
+  const releases = await prisma.appRelease.findMany({ orderBy: { created_at: 'desc' } });
+  res.json({ success: true, data: releases });
+});
+
+/**
+ * POST /api/admin/releases
+ * Create a new release entry.
+ * Body: { version, channel?, changelog?, download_url, file_size?, is_mandatory?, published? }
+ */
+router.post('/releases', async (req: Request, res: Response) => {
+  const {
+    version, channel = 'stable', changelog = '', download_url,
+    file_size = 0, is_mandatory = false, published = true,
+  } = req.body as Record<string, any>;
+
+  if (!version?.trim())     { res.status(400).json({ success: false, error: 'version is required' }); return; }
+  if (!download_url?.trim()){ res.status(400).json({ success: false, error: 'download_url is required' }); return; }
+
+  // Check duplicate version
+  const existing = await prisma.appRelease.findUnique({ where: { version: version.trim() } });
+  if (existing) { res.status(409).json({ success: false, error: `Version ${version} already exists` }); return; }
+
+  const release = await prisma.appRelease.create({
+    data: {
+      version:      version.trim(),
+      channel:      channel || 'stable',
+      changelog:    changelog || '',
+      download_url: download_url.trim(),
+      file_size:    Number(file_size) || 0,
+      is_mandatory: !!is_mandatory,
+      published:    published !== false,
+    },
+  });
+
+  res.status(201).json({ success: true, data: release });
+});
+
+/**
+ * PATCH /api/admin/releases/:id
+ * Update fields (publish/unpublish, toggle mandatory, fix changelog, etc.)
+ */
+router.patch('/releases/:id', async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  const allowed = ['changelog', 'download_url', 'file_size', 'is_mandatory', 'published', 'channel'];
+  const data: Record<string, any> = {};
+  for (const k of allowed) {
+    if (req.body[k] !== undefined) data[k] = req.body[k];
+  }
+  const release = await prisma.appRelease.update({ where: { id }, data });
+  res.json({ success: true, data: release });
+});
+
+/**
+ * DELETE /api/admin/releases/:id
+ * Remove a release record entirely.
+ */
+router.delete('/releases/:id', async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  await prisma.appRelease.delete({ where: { id } });
+  res.json({ success: true, message: 'Release deleted' });
 });
 
 export default router;

@@ -9,7 +9,8 @@ import authRoutes      from './routes/auth';
 import instanceRoutes  from './routes/instances';
 import syncRoutes      from './routes/sync';
 import adminRoutes     from './routes/admin';
-import businessRoutes from './routes/businesses';   // ← add this
+import businessRoutes  from './routes/businesses';
+import updateRoutes    from './routes/updates';
 
 // Prisma client is lazily initialized on first use — no explicit bootstrap needed.
 
@@ -73,10 +74,8 @@ app.use('/api/auth',       authLimiter,  authRoutes);
 app.use('/api/instances',  syncLimiter,  instanceRoutes);
 app.use('/api/sync',       syncLimiter,  syncRoutes);
 app.use('/api/admin',                   adminRoutes);
-//besiness
-
-// inside the routes section:
-app.use('/api', businessRoutes);                    // ← add this
+app.use('/api/updates',                 updateRoutes);  // public — no auth
+app.use('/api',                         businessRoutes);
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'pos-backend-cloud', timestamp: new Date().toISOString() });

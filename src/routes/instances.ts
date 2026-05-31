@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import prisma from '../db';
 import { requireInstance } from '../middleware/instanceAuth';
+import { signMobileToken } from '../middleware/auth';
 import '../types';
 
 const router = Router();
@@ -238,6 +239,76 @@ router.get('/export', requireInstance, async (req: Request, res: Response) => {
     customer_payments: structured.customer_payments || [],
     raw_events_count:  rawEvents.length,
   });
+});
+
+// ─── Mobile Token Exchange ────────────────────────────────────────────────────
+/**
+ * POST /api/instances/mobile-token   [instanceAuth]
+ *
+ * Called by the POS app (or from the mobile app's "Sign in with store" flow).
+ * Returns a long-lived JWT scoped to this instance for mobile app access.
+ *
+ * Requirements:
+ *  - Instance must be approved
+ *  - Admin must have enabled mobile_access for this instance
+ *
+ * The POS app calls this after the admin enables mobile access, saves the token
+ * to local settings, and shows it to the store owner in the Settings screen.
+ *
+ * The mobile app can then use this token directly as a "sign in with store" credential.
+ */
+router.post('/mobile-token', requireInstance, async (req: Request, res: Response) => {
+  const inst = req.instance!;
+
+  if (inst.approval_status !== 'approved') {
+    res.status(403).json({ success: false, error: 'Instance not yet approved' });
+    return;
+  }
+
+  // Fetch latest mobile_access flag from DB
+  const row = await prisma.instance.findUnique({
+    where: { instance_id: inst.instance_id },
+    select: { mobile_access: true, store_name: true, owner_mobile: true },
+  });
+
+  if (!row?.mobile_access) {
+    res.status(403).json({
+      success: false,
+      error: 'Mobile access not enabled for this store. Ask your admin to enable it.',
+    });
+    return;
+  }
+
+  const token = signMobileToken({
+    instance_id:  inst.instance_id,
+    store_name:   row.store_name   || inst.instance_id,
+    owner_mobile: row.owner_mobile || '',
+    scope:        'mobile',
+  });
+
+  res.json({
+    success: true,
+    mobile_token: token,
+    instance_id:  inst.instance_id,
+    store_name:   row.store_name,
+    // Tell the mobile app what to display on the login screen
+    login_hint:   `Sign in as: ${row.store_name || inst.instance_id}`,
+  });
+});
+
+/**
+ * GET /api/instances/mobile-status   [instanceAuth]
+ *
+ * Lightweight endpoint the POS app polls to check if mobile access was
+ * enabled/disabled since the last check.
+ */
+router.get('/mobile-status', requireInstance, async (req: Request, res: Response) => {
+  const inst = req.instance!;
+  const row = await prisma.instance.findUnique({
+    where:  { instance_id: inst.instance_id },
+    select: { mobile_access: true },
+  });
+  res.json({ success: true, mobile_access: !!row?.mobile_access });
 });
 
 export default router;

@@ -33,6 +33,7 @@ model Instance {
   device_fingerprint String    @default("")
   license_revoked    Int       @default(0)  // 0 | 1 — POS expects an integer
   branch_name        String    @default("Main Branch")
+  mobile_access      Boolean   @default(false)   // admin toggles this to allow mobile app login
   created_at         DateTime  @default(now())
   updated_at         DateTime  @updatedAt
 
@@ -120,6 +121,25 @@ model Notification {
 
   @@map("notifications")
   @@index([target_instance_id])
+}
+
+// ── App Releases ──────────────────────────────────────────────────────────────
+// The admin creates a release record pointing to the .exe download URL.
+// The POS app polls /api/updates/latest to discover new versions.
+model AppRelease {
+  id           Int      @id @default(autoincrement())
+  version      String   @unique              // semver e.g. "2.1.0"
+  channel      String   @default("stable")  // "stable" | "beta"
+  changelog    String   @default("")        // markdown or plain text
+  download_url String                        // direct .exe download URL
+  file_size    Int      @default(0)          // bytes (shown in UI)
+  is_mandatory Boolean  @default(false)      // forces update, no skip
+  published    Boolean  @default(true)       // false = draft/hidden
+  created_at   DateTime @default(now())
+  published_by String   @default("admin")
+
+  @@map("app_releases")
+  @@index([channel, published])
 }
 
 model NotificationRead {
