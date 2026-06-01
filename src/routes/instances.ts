@@ -238,41 +238,64 @@ router.get('/export', requireInstance, async (req: Request, res: Response) => {
     structured[type] = Array.from(items.values());
   }
 
-  // Fallback: if no sale sync-events, pull from instance_sales (flat records)
-  // Note: structured key is singular 'sale' (matching entity_type in sync_events)
+  // ── Fallbacks for data that may exist in flattened tables even without full sync events ──
   const fallbackSales = structured.sale?.length ? [] :
     await prisma.instanceSale.findMany({ where: { instance_id: instanceId }, orderBy: { date_created: 'asc' } });
 
+  // Inventory batches: try from separate events first; if missing, extract from purchase payloads
+  let invBatches: any[] = structured.inventory_batch || [];
+  if (invBatches.length === 0 && (structured.purchase || []).length > 0) {
+    for (const pur of structured.purchase || []) {
+      if (Array.isArray((pur as any).items)) {
+        for (const b of (pur as any).items) invBatches.push(b);
+      }
+    }
+  }
+
+  // Settings: use synced settings_info if available, otherwise use instance fields
+  const settingsRow: any = (structured.settings || [])[0] || null;
+
   res.json({
     exported_at:            new Date().toISOString(),
-    instance: {
-      store_name:           req.instance!.store_name,
-      owner_name:           req.instance!.owner_name,
-      owner_mobile:         req.instance!.owner_mobile,
-      license_plan:         req.instance!.license_plan,
-      approval_status:      req.instance!.approval_status,
-    },
-    // ── Core tables ─────────────────────────────────────────────────────────
+    // ── Settings (store info) ────────────────────────────────────────────────
+    // Returned as a 1-row array so import-data handler processes it like a table
+    settings: settingsRow
+      ? [{ id: 1, ...settingsRow }]
+      : [{
+          id: 1,
+          store_name:      req.instance!.store_name,
+          owner_full_name: req.instance!.owner_name,
+          owner_mobile:    req.instance!.owner_mobile,
+          store_phone:     req.instance!.owner_mobile,
+          business_name:   req.instance!.store_name,
+        }],
+    // ── Core ────────────────────────────────────────────────────────────────
     products:               structured.product          || [],
     customers:              structured.customer         || [],
     vendors:                structured.vendor           || [],
-    expenses:               structured.expense          || [],
-    accounts:               structured.account          || [],
+    employees:              structured.employee         || [],
     // ── Sales ───────────────────────────────────────────────────────────────
-    sales:                  structured.sale?.length     ? structured.sale     : fallbackSales,
+    sales:                  structured.sale?.length     ? structured.sale : fallbackSales,
     sale_items:             structured.sale_item        || [],
     sale_returns:           structured.sale_return      || [],
     sale_return_items:      structured.sale_return_item || [],
-    // ── Purchases ───────────────────────────────────────────────────────────
+    // ── Purchases & Stock ────────────────────────────────────────────────────
     purchases:              structured.purchase         || [],
-    inventory_batches:      structured.inventory_batch  || [],
+    inventory_batches:      invBatches,
     purchase_returns:       structured.purchase_return  || [],
     purchase_return_items:  structured.purchase_return_item || [],
+    stock_adjustments:      structured.stock_adjustment || [],
     // ── Payments ────────────────────────────────────────────────────────────
     customer_payments:      structured.customer_payment || [],
     vendor_payments:        structured.vendor_payment   || [],
+    // ── Finance ─────────────────────────────────────────────────────────────
+    expenses:               structured.expense          || [],
+    accounts:               structured.account          || [],
     account_txns:           structured.account_txn      || [],
+    registers:              structured.register         || [],
     financial_transactions: structured.financial_transaction || [],
+    // ── History ─────────────────────────────────────────────────────────────
+    entity_history:         structured.entity_history || [],
     // ── Meta ────────────────────────────────────────────────────────────────
     raw_events_count:       rawEvents.length,
   });

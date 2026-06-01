@@ -67,16 +67,36 @@ async function parseEntityFromSync(instanceId: string, entityType: string): Prom
 }
 
 // ─── Export-all helper ────────────────────────────────────────────────────────
+// Maps singular entity_type (used in sync_events) → plural SQLite table name.
+// Must be kept in sync with full-resync entity types in main.ts.
 const ENTITY_TO_TABLE: Record<string, string> = {
-  product:               'products',   customer:              'customers',
-  vendor:                'vendors',    purchase:              'purchases',
-  sale:                  'sales',      sale_item:             'sale_items',
-  expense:               'expenses',   account:               'accounts',
-  account_txn:           'account_txns', vendor_payment:      'vendor_payments',
-  customer_payment:      'customer_payments', inventory_batch: 'inventory_batches',
-  sale_return:           'sale_returns',   sale_return_item:  'sale_return_items',
-  purchase_return:       'purchase_returns', purchase_return_item: 'purchase_return_items',
-  financial_transaction: 'financial_transactions', register:   'registers',
+  // Core
+  product:               'products',
+  customer:              'customers',
+  vendor:                'vendors',
+  employee:              'employees',
+  settings:              'settings',
+  // Sales
+  sale:                  'sales',
+  sale_item:             'sale_items',
+  sale_return:           'sale_returns',
+  sale_return_item:      'sale_return_items',
+  // Purchases & Stock
+  purchase:              'purchases',
+  inventory_batch:       'inventory_batches',
+  purchase_return:       'purchase_returns',
+  purchase_return_item:  'purchase_return_items',
+  stock_adjustment:      'stock_adjustments',
+  // Payments
+  customer_payment:      'customer_payments',
+  vendor_payment:        'vendor_payments',
+  // Finance
+  expense:               'expenses',
+  account:               'accounts',
+  account_txn:           'account_txns',
+  register:              'registers',
+  financial_transaction: 'financial_transactions',
+  // History
   entity_history:        'entity_history',
 };
 
