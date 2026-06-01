@@ -107,7 +107,7 @@ router.post('/register', async (req: Request, res: Response) => {
 router.get('/status', requireInstance, (req: Request, res: Response) => {
   const inst = req.instance!;
   res.json({
-    success: true,
+    success:         true,
     instance_id:     inst.instance_id,
     approval_status: inst.approval_status,
     license_key:     inst.license_key || null,
@@ -116,6 +116,8 @@ router.get('/status', requireInstance, (req: Request, res: Response) => {
     license_revoked: inst.license_revoked || 0,
     block_reason:    inst.block_reason || null,
     store_name:      inst.store_name,
+    // Cloud-only soft block — sync is disabled but POS keeps running locally
+    cloud_blocked:   (inst as any).cloud_blocked ?? false,
   });
 });
 
@@ -141,15 +143,19 @@ router.post('/heartbeat', requireInstance, async (req: Request, res: Response) =
 
   const updated = await prisma.instance.findUnique({
     where:  { instance_id: inst.instance_id },
-    select: { approval_status: true, license_plan: true, license_expiry: true, block_reason: true },
+    select: { approval_status: true, license_plan: true, license_expiry: true,
+              block_reason: true, cloud_blocked: true },
   });
 
   res.json({
-    success: true,
+    success:         true,
     approval_status: updated?.approval_status,
     license_plan:    updated?.license_plan,
     license_expiry:  updated?.license_expiry,
-    message: updated?.approval_status === 'blocked' ? (updated.block_reason || 'Account blocked') : null,
+    cloud_blocked:   updated?.cloud_blocked ?? false,
+    message: updated?.approval_status === 'blocked'
+               ? (updated.block_reason || 'Account blocked')
+               : (updated?.cloud_blocked ? (updated.block_reason || 'Cloud sync blocked by administrator') : null),
   });
 });
 

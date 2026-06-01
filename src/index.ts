@@ -17,6 +17,10 @@ import updateRoutes    from './routes/updates';
 const app  = express();
 const PORT = Number(process.env.PORT) || 5000;
 
+// Trust Nginx reverse-proxy — required for express-rate-limit to read the
+// real client IP from X-Forwarded-For without throwing ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+app.set('trust proxy', 1);
+
 // ─── CORS (must come BEFORE helmet) ──────────────────────────────────────────
 // Default: '*' (allow all). Set ALLOWED_ORIGINS in .env to restrict to specific
 // domains in production (comma-separated, supports '*' wildcard entry).

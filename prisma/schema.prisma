@@ -34,6 +34,7 @@ model Instance {
   license_revoked    Int       @default(0)  // 0 | 1 — POS expects an integer
   branch_name        String    @default("Main Branch")
   mobile_access      Boolean   @default(false)   // admin toggles this to allow mobile app login
+  cloud_blocked      Boolean   @default(false)   // soft-block: sync disabled, POS still runs locally
   created_at         DateTime  @default(now())
   updated_at         DateTime  @updatedAt
 

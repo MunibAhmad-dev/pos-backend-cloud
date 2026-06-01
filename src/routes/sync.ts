@@ -21,6 +21,17 @@ interface SyncItem {
  */
 router.post('/', requireInstance, async (req: Request, res: Response) => {
   const inst  = req.instance!;
+
+  // Cloud-only soft block — instance can still run locally but sync is suspended
+  if ((inst as any).cloud_blocked) {
+    res.status(403).json({
+      success: false,
+      error:   'cloud_blocked',
+      message: (inst as any).block_reason || 'Cloud sync has been suspended for this instance by the administrator.',
+    });
+    return;
+  }
+
   const { items } = req.body as { items?: SyncItem[] };
 
   if (!Array.isArray(items) || items.length === 0) {

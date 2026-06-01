@@ -381,6 +381,7 @@ router.post('/instances/:id/unblock-license', async (req: Request, res: Response
       where: { instance_id: req.params.id },
       data: {
         approval_status: 'approved', license_revoked: 0, block_reason: '',
+        cloud_blocked:   false,  // lifting license block also lifts cloud block
         license_key:    restoredKey.license_key,
         license_plan:   restoredKey.plan || 'standard',
         license_expiry: restoredKey.expires_at || null,
@@ -390,13 +391,40 @@ router.post('/instances/:id/unblock-license', async (req: Request, res: Response
   } else {
     await prisma.instance.update({
       where: { instance_id: req.params.id },
-      data: { approval_status: 'approved', license_revoked: 0, block_reason: '' },
+      data: { approval_status: 'approved', license_revoked: 0, block_reason: '', cloud_blocked: false },
     });
     res.json({ success: true, message: 'License unblocked (no previous key to restore). Use Approve to issue a new license key.' });
   }
 });
 
-// ── Block instance ─────────────────────────────────────────────────────────────
+// ── Cloud-only block (soft block) ─────────────────────────────────────────────
+// Suspends cloud sync — POS keeps running locally but cannot push/pull data.
+// Does NOT touch approval_status or license_revoked.
+router.post('/instances/:id/block-cloud', async (req: Request, res: Response) => {
+  const { reason } = req.body as { reason?: string };
+  const inst = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
+  if (!inst) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  await prisma.instance.update({
+    where: { instance_id: req.params.id },
+    data:  { cloud_blocked: true, block_reason: reason || 'Cloud sync suspended by admin' },
+  });
+  res.json({ success: true, message: `Cloud sync suspended for ${req.params.id}` });
+});
+
+// ── Unblock cloud (lift soft block) ───────────────────────────────────────────
+router.post('/instances/:id/unblock-cloud', async (req: Request, res: Response) => {
+  const inst = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
+  if (!inst) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  await prisma.instance.update({
+    where: { instance_id: req.params.id },
+    data:  { cloud_blocked: false, block_reason: '' },
+  });
+  res.json({ success: true, message: `Cloud sync restored for ${req.params.id}` });
+});
+
+// ── Legacy: block instance (kept for backward-compat, now behaves like block-cloud) ──
 router.post('/instances/:id/block', async (req: Request, res: Response) => {
   const { reason } = req.body as { reason?: string };
   const inst = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
@@ -404,9 +432,9 @@ router.post('/instances/:id/block', async (req: Request, res: Response) => {
 
   await prisma.instance.update({
     where: { instance_id: req.params.id },
-    data:  { approval_status: 'blocked', block_reason: reason || 'Blocked by admin' },
+    data:  { cloud_blocked: true, block_reason: reason || 'Cloud sync suspended by admin' },
   });
-  res.json({ success: true, message: `Instance ${req.params.id} blocked` });
+  res.json({ success: true, message: `Instance ${req.params.id} cloud-blocked (legacy endpoint)` });
 });
 
 // ── Mobile Access Toggle ───────────────────────────────────────────────────────
@@ -973,6 +1001,7 @@ router.get('/notifications', async (_req: Request, res: Response) => {
       i.store_name AS target_store_name
     FROM notifications n
     LEFT JOIN instances i ON n.target_instance_id = i.instance_id
+    WHERE n.is_active = true
     ORDER BY n.sent_at DESC LIMIT 200
   `);
   res.json({ success: true, data: notifications });
@@ -1025,9 +1054,14 @@ router.post('/notifications', async (req: Request, res: Response) => {
 });
 
 router.delete('/notifications/:id', async (req: Request, res: Response) => {
-  const note = await prisma.notification.findUnique({ where: { id: Number(req.params.id) } });
+  const id = Number(req.params.id);
+  const note = await prisma.notification.findUnique({ where: { id } });
   if (!note) { res.status(404).json({ success: false, error: 'Notification not found' }); return; }
-  await prisma.notification.update({ where: { id: Number(req.params.id) }, data: { is_active: false } });
+
+  // Delete reads first (FK constraint), then the notification itself
+  await prisma.notificationRead.deleteMany({ where: { notification_id: id } });
+  await prisma.notification.delete({ where: { id } });
+
   res.json({ success: true, message: 'Notification deleted' });
 });
 
