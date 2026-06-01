@@ -110,17 +110,22 @@ model LicenseKey {
 }
 
 model Notification {
-  id                 Int      @id @default(autoincrement())
+  id                 Int       @id @default(autoincrement())
   title              String
   body               String
   target_instance_id String?
-  sent_at            DateTime @default(now())
-  is_active          Boolean  @default(true)
+  sent_at            DateTime  @default(now())
+  is_active          Boolean   @default(true)
+  // Optional expiry — null means permanent until admin deletes it
+  expires_at         DateTime?
+  // Display type for the POS client
+  display_type       String    @default("marquee")   // "marquee" | "banner" | "popup"
 
   notification_reads NotificationRead[]
 
   @@map("notifications")
   @@index([target_instance_id])
+  @@index([is_active, expires_at])
 }
 
 // ── App Releases ──────────────────────────────────────────────────────────────

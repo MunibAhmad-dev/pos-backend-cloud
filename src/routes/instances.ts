@@ -161,16 +161,20 @@ router.post('/heartbeat', requireInstance, async (req: Request, res: Response) =
 router.get('/notifications', requireInstance, async (req: Request, res: Response) => {
   const instanceId = req.instance!.instance_id;
 
-  // Find unread active notifications for this instance
+  const now = new Date();
+
+  // Find unread active notifications — exclude expired ones
   const notifications = await prisma.notification.findMany({
     where: {
       is_active: true,
       OR: [{ target_instance_id: null }, { target_instance_id: instanceId }],
       notification_reads: { none: { instance_id: instanceId } },
+      // Show if not expired (expires_at IS NULL means permanent)
+      AND: [{ OR: [{ expires_at: null }, { expires_at: { gt: now } }] }],
     },
     orderBy: { sent_at: 'desc' },
     take:    20,
-    select:  { id: true, title: true, body: true, sent_at: true },
+    select:  { id: true, title: true, body: true, sent_at: true, display_type: true, expires_at: true },
   });
 
   // Mark all as read
@@ -181,7 +185,20 @@ router.get('/notifications', requireInstance, async (req: Request, res: Response
     });
   }
 
-  res.json({ success: true, data: notifications });
+  // Also return current active marquee notifications (re-send even if read — for display)
+  const marquees = await prisma.notification.findMany({
+    where: {
+      is_active: true,
+      display_type: 'marquee',
+      OR: [{ target_instance_id: null }, { target_instance_id: instanceId }],
+      AND: [{ OR: [{ expires_at: null }, { expires_at: { gt: now } }] }],
+    },
+    orderBy: { sent_at: 'desc' },
+    take: 5,
+    select: { id: true, title: true, body: true, sent_at: true, display_type: true, expires_at: true },
+  });
+
+  res.json({ success: true, data: notifications, marquees });
 });
 
 /**
@@ -238,6 +255,48 @@ router.get('/export', requireInstance, async (req: Request, res: Response) => {
     inventory_batches: structured.inventory_batches || [],
     customer_payments: structured.customer_payments || [],
     raw_events_count:  rawEvents.length,
+  });
+});
+
+// ─── Sync Status (for POS Settings "What's backed up") ───────────────────────
+/**
+ * GET /api/instances/sync-status   [instanceAuth]
+ *
+ * Returns a breakdown of what's been synced to the cloud vs what's still local.
+ * The POS Settings page uses this to show "X products synced, Y pending" etc.
+ */
+router.get('/sync-status', requireInstance, async (req: Request, res: Response) => {
+  const instanceId = req.instance!.instance_id;
+
+  // Count distinct entity types that have been synced
+  const syncedCounts = await prisma.syncEvent.groupBy({
+    by:        ['entity_type'],
+    where:     { instance_id: instanceId },
+    _count:    { _all: true },
+  });
+
+  const syncedByType: Record<string, number> = {};
+  for (const row of syncedCounts) {
+    syncedByType[row.entity_type] = row._count._all;
+  }
+
+  const lastEvent = await prisma.syncEvent.findFirst({
+    where:   { instance_id: instanceId },
+    orderBy: { received_at: 'desc' },
+    select:  { received_at: true },
+  });
+
+  const salesCount = await prisma.instanceSale.count({ where: { instance_id: instanceId } });
+
+  res.json({
+    success: true,
+    data: {
+      instance_id:    instanceId,
+      last_synced_at: lastEvent?.received_at ?? null,
+      synced_sales:   salesCount,
+      by_entity:      syncedByType,
+      total_events:   Object.values(syncedByType).reduce((s, v) => s + v, 0),
+    },
   });
 });
 

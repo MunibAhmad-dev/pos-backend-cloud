@@ -979,19 +979,49 @@ router.get('/notifications', async (_req: Request, res: Response) => {
 });
 
 router.post('/notifications', async (req: Request, res: Response) => {
-  const { title, body, instance_id } = req.body as { title: string; body: string; instance_id?: string };
-  if (!title?.trim() || !body?.trim()) { res.status(400).json({ success: false, error: 'title and body are required' }); return; }
+  const {
+    title, body, instance_id,
+    duration_hours,  // null = permanent
+    display_type = 'marquee',  // 'marquee' | 'banner' | 'popup'
+  } = req.body as {
+    title: string; body: string; instance_id?: string;
+    duration_hours?: number | null; display_type?: string;
+  };
 
+  if (!title?.trim() || !body?.trim()) {
+    res.status(400).json({ success: false, error: 'title and body are required' });
+    return;
+  }
   if (instance_id) {
     const exists = await prisma.instance.findUnique({ where: { instance_id }, select: { id: true } });
     if (!exists) { res.status(404).json({ success: false, error: 'Target instance not found' }); return; }
   }
 
+  const expires_at = duration_hours
+    ? new Date(Date.now() + Number(duration_hours) * 3_600_000)
+    : null;
+
   const note = await prisma.notification.create({
-    data: { title: title.trim(), body: body.trim(), target_instance_id: instance_id || null },
+    data: {
+      title: title.trim(),
+      body:  body.trim(),
+      target_instance_id: instance_id || null,
+      display_type: display_type || 'marquee',
+      expires_at,
+    },
   });
 
-  res.status(201).json({ success: true, data: { id: note.id, title: note.title, body: note.body, target_instance_id: note.target_instance_id } });
+  res.status(201).json({
+    success: true,
+    data: {
+      id:                 note.id,
+      title:              note.title,
+      body:               note.body,
+      target_instance_id: note.target_instance_id,
+      display_type:       note.display_type,
+      expires_at:         note.expires_at,
+    },
+  });
 });
 
 router.delete('/notifications/:id', async (req: Request, res: Response) => {
