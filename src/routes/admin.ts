@@ -699,27 +699,39 @@ router.get('/analytics', async (req: Request, res: Response) => {
   `);
 
   // Sales trend by day
+  // Strategy: try the requested date range first. If that returns 0 rows, automatically
+  // expand to show ALL available data so the chart is never blank when data exists.
+  const salesDayQ = (whereClause: Prisma.Sql) => prisma.$queryRaw<any[]>(Prisma.sql`
+    SELECT TO_CHAR(CAST(date_created AS TIMESTAMP), 'YYYY-MM-DD') AS day,
+           COUNT(*)::int                                           AS sales_count,
+           COALESCE(SUM(total), 0)::float                         AS revenue,
+           COUNT(DISTINCT instance_id)::int                       AS active_stores
+    FROM instance_sales
+    WHERE date_created IS NOT NULL ${whereClause}
+    GROUP BY day ORDER BY day
+  `);
+
   let salesByDay: any[];
   if (hasDateRange) {
-    salesByDay = await prisma.$queryRaw<any[]>(Prisma.sql`
-      SELECT TO_CHAR(CAST(date_created AS TIMESTAMP), 'YYYY-MM-DD') AS day,
-             COUNT(*)::int                                           AS sales_count,
-             COALESCE(SUM(total), 0)::float                         AS revenue,
-             COUNT(DISTINCT instance_id)::int                       AS active_stores
-      FROM instance_sales
-      WHERE DATE(CAST(date_created AS TIMESTAMP)) BETWEEN ${date_from}::date AND ${date_to}::date
-      GROUP BY day ORDER BY day
-    `);
+    salesByDay = await salesDayQ(
+      Prisma.sql`AND DATE(CAST(date_created AS TIMESTAMP)) BETWEEN ${date_from}::date AND ${date_to}::date`
+    );
+    // If selected range is empty, fall back to last 90 days, then all-time
+    if (salesByDay.length === 0) {
+      salesByDay = await salesDayQ(
+        Prisma.sql`AND CAST(date_created AS TIMESTAMP) >= NOW() - INTERVAL '90 days'`
+      );
+    }
+    if (salesByDay.length === 0) {
+      salesByDay = await salesDayQ(Prisma.sql``);   // all-time fallback
+    }
   } else {
-    salesByDay = await prisma.$queryRaw<any[]>(Prisma.sql`
-      SELECT TO_CHAR(CAST(date_created AS TIMESTAMP), 'YYYY-MM-DD') AS day,
-             COUNT(*)::int                                           AS sales_count,
-             COALESCE(SUM(total), 0)::float                         AS revenue,
-             COUNT(DISTINCT instance_id)::int                       AS active_stores
-      FROM instance_sales
-      WHERE CAST(date_created AS TIMESTAMP) >= NOW() - INTERVAL '30 days'
-      GROUP BY day ORDER BY day
-    `);
+    salesByDay = await salesDayQ(
+      Prisma.sql`AND CAST(date_created AS TIMESTAMP) >= NOW() - INTERVAL '30 days'`
+    );
+    if (salesByDay.length === 0) {
+      salesByDay = await salesDayQ(Prisma.sql``);
+    }
   }
 
   // Top entity types by event count
@@ -758,15 +770,29 @@ router.get('/analytics', async (req: Request, res: Response) => {
     FROM sync_events WHERE entity_type = 'vendor' AND operation = 'create'
   `);
 
-  // Profit & Loss by month
+  // Profit & Loss by month — all-time fallback when date range has no data
   let plRevRows: any[], plExpRows: any[];
+  const plRevAllTime = () => prisma.$queryRaw<any[]>(Prisma.sql`
+    SELECT TO_CHAR(CAST(date_created AS TIMESTAMP), 'YYYY-MM') AS month,
+           COALESCE(SUM(total), 0)::float AS revenue
+    FROM instance_sales WHERE date_created IS NOT NULL
+    GROUP BY month ORDER BY month
+  `);
+  const plExpAllTime = () => prisma.$queryRaw<any[]>(Prisma.sql`
+    SELECT TO_CHAR(received_at, 'YYYY-MM') AS month,
+           COALESCE(SUM(CAST((payload::jsonb)->>'amount' AS FLOAT)), 0) AS expenses
+    FROM sync_events WHERE entity_type = 'expense' AND operation != 'delete'
+    GROUP BY month ORDER BY month
+  `);
+
   if (hasDateRange) {
     [plRevRows, plExpRows] = await Promise.all([
       prisma.$queryRaw<any[]>(Prisma.sql`
         SELECT TO_CHAR(CAST(date_created AS TIMESTAMP), 'YYYY-MM') AS month,
                COALESCE(SUM(total), 0)::float AS revenue
         FROM instance_sales
-        WHERE DATE(CAST(date_created AS TIMESTAMP)) BETWEEN ${date_from}::date AND ${date_to}::date
+        WHERE date_created IS NOT NULL
+          AND DATE(CAST(date_created AS TIMESTAMP)) BETWEEN ${date_from}::date AND ${date_to}::date
         GROUP BY month ORDER BY month
       `),
       prisma.$queryRaw<any[]>(Prisma.sql`
@@ -778,24 +804,31 @@ router.get('/analytics', async (req: Request, res: Response) => {
         GROUP BY month ORDER BY month
       `),
     ]);
+    // Fallback to all-time if range returns nothing
+    if (plRevRows.length === 0 && plExpRows.length === 0) {
+      [plRevRows, plExpRows] = await Promise.all([plRevAllTime(), plExpAllTime()]);
+    }
   } else {
     [plRevRows, plExpRows] = await Promise.all([
       prisma.$queryRaw<any[]>(Prisma.sql`
         SELECT TO_CHAR(CAST(date_created AS TIMESTAMP), 'YYYY-MM') AS month,
                COALESCE(SUM(total), 0)::float AS revenue
         FROM instance_sales
-        WHERE CAST(date_created AS TIMESTAMP) >= NOW() - INTERVAL '12 months'
+        WHERE date_created IS NOT NULL
+          AND CAST(date_created AS TIMESTAMP) >= NOW() - INTERVAL '12 months'
         GROUP BY month ORDER BY month
       `),
       prisma.$queryRaw<any[]>(Prisma.sql`
         SELECT TO_CHAR(received_at, 'YYYY-MM') AS month,
                COALESCE(SUM(CAST((payload::jsonb)->>'amount' AS FLOAT)), 0) AS expenses
-        FROM sync_events
-        WHERE entity_type = 'expense' AND operation != 'delete'
+        FROM sync_events WHERE entity_type = 'expense' AND operation != 'delete'
           AND received_at >= NOW() - INTERVAL '12 months'
         GROUP BY month ORDER BY month
       `),
     ]);
+    if (plRevRows.length === 0 && plExpRows.length === 0) {
+      [plRevRows, plExpRows] = await Promise.all([plRevAllTime(), plExpAllTime()]);
+    }
   }
 
   const plMerge = new Map<string, { revenue: number; expenses: number }>();
@@ -807,15 +840,19 @@ router.get('/analytics', async (req: Request, res: Response) => {
   const profitLossData = Array.from(plMerge.entries()).sort(([a], [b]) => a.localeCompare(b))
     .map(([month, d]) => ({ month, revenue: Math.round(d.revenue), expenses: Math.round(d.expenses), profit: Math.round(d.revenue - d.expenses) }));
 
-  // Registration trend (last 12 months)
+  // Registration trend — ALL TIME grouped by month so the chart is never blank.
+  // Includes a running cumulative total so the dashboard can show growth over time.
   const regTrend = await prisma.$queryRaw<any[]>(Prisma.sql`
-    SELECT TO_CHAR(created_at, 'YYYY-MM') AS month, COUNT(*)::int AS count
+    SELECT TO_CHAR(created_at, 'YYYY-MM') AS month,
+           COUNT(*)::int                  AS count
     FROM instances
-    WHERE created_at >= NOW() - INTERVAL '12 months'
     GROUP BY month ORDER BY month
   `);
   let cumulative = 0;
-  const registrationsTrend = regTrend.map(r => { cumulative += Number(r.count); return { month: r.month, newStores: Number(r.count), total: cumulative }; });
+  const registrationsTrend = regTrend.map(r => {
+    cumulative += Number(r.count);
+    return { month: r.month, newStores: Number(r.count), total: cumulative };
+  });
 
   // Account stats from sync_events
   const [accountTypeDist, accountTxnVolume, accountBalRow, accountTxnRow] = await Promise.all([
