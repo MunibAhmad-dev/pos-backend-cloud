@@ -66,7 +66,7 @@ router.post('/', requireInstance, async (req: Request, res: Response) => {
             },
           });
 
-          // Flatten sale creates into instance_sales
+          // Flatten sale creates into instance_sales (upsert — idempotent on re-sync)
           if (item.entity_type === 'sale' && item.operation === 'create') {
             const p      = item.payload;
             const saleId = p.id ?? p.sale_id;
@@ -96,11 +96,9 @@ router.post('/', requireInstance, async (req: Request, res: Response) => {
                   date_created:   p.date_created          || null,
                 },
               });
-
-              if ((p.status || 'Completed') === 'Completed') {
-                newSalesRevenue += Number(p.total || 0);
-                newSalesCount   += 1;
-              }
+              // Mark that sales were touched so we recalculate totals below
+              newSalesCount   = 1;   // signal: at least one sale was upserted
+              newSalesRevenue = 1;   // will be replaced by real aggregate below
             }
           }
 
@@ -140,15 +138,33 @@ router.post('/', requireInstance, async (req: Request, res: Response) => {
         productCount = Number(row?.cnt ?? 0);
       }
 
+      // ── Recalculate sale aggregates from source-of-truth ─────────────────────
+      // NEVER use increment() for totals — re-syncing the same sale would inflate
+      // the numbers. Always recount from instance_sales so the result is idempotent.
+      let realSalesCount:   number | null = null;
+      let realSalesRevenue: number | null = null;
+
+      if (newSalesCount > 0) {
+        const [agg] = await tx.$queryRaw<[{ cnt: bigint; rev: string }]>(Prisma.sql`
+          SELECT COUNT(*)::int         AS cnt,
+                 COALESCE(SUM(total), 0)::float AS rev
+          FROM   instance_sales
+          WHERE  instance_id = ${inst.instance_id}
+            AND  status      = 'Completed'
+        `);
+        realSalesCount   = Number(agg?.cnt ?? 0);
+        realSalesRevenue = Number(agg?.rev ?? 0);
+      }
+
       // Update instance aggregates
       await tx.instance.update({
         where: { instance_id: inst.instance_id },
         data: {
           last_seen:       new Date(),
-          total_sales:     newSalesCount    > 0 ? { increment: newSalesCount }    : undefined,
-          total_revenue:   newSalesRevenue  > 0 ? { increment: newSalesRevenue }  : undefined,
-          total_customers: customerCount != null ? customerCount : undefined,
-          total_products:  productCount  != null ? productCount  : undefined,
+          total_sales:     realSalesCount   != null ? realSalesCount   : undefined,
+          total_revenue:   realSalesRevenue != null ? realSalesRevenue : undefined,
+          total_customers: customerCount    != null ? customerCount    : undefined,
+          total_products:  productCount     != null ? productCount     : undefined,
         },
       });
     });

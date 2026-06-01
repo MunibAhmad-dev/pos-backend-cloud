@@ -365,6 +365,18 @@ router.post('/instances/:id/block-license', async (req: Request, res: Response) 
   res.json({ success: true, message: 'License revoked — POS will clear local license on next sync' });
 });
 
+// ── License restore preview ────────────────────────────────────────────────────
+// Returns whether this instance has a restorable (previously deactivated) key.
+// Used by the frontend to decide which unblock options to show.
+router.get('/instances/:id/license-preview', async (req: Request, res: Response) => {
+  const prev = await prisma.licenseKey.findFirst({
+    where:   { instance_id: req.params.id, is_active: false },
+    orderBy: { issued_at: 'desc' },
+    select:  { license_key: true, plan: true, expires_at: true, duration_days: true },
+  });
+  res.json({ success: true, has_previous: !!prev, previous: prev ?? null });
+});
+
 // ── Unblock license ────────────────────────────────────────────────────────────
 router.post('/instances/:id/unblock-license', async (req: Request, res: Response) => {
   const inst = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });

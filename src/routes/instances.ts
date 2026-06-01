@@ -238,29 +238,43 @@ router.get('/export', requireInstance, async (req: Request, res: Response) => {
     structured[type] = Array.from(items.values());
   }
 
-  // Fallback to instance_sales if no sale events
-  const fallbackSales = structured.sales?.length ? [] :
+  // Fallback: if no sale sync-events, pull from instance_sales (flat records)
+  // Note: structured key is singular 'sale' (matching entity_type in sync_events)
+  const fallbackSales = structured.sale?.length ? [] :
     await prisma.instanceSale.findMany({ where: { instance_id: instanceId }, orderBy: { date_created: 'asc' } });
 
   res.json({
-    exported_at:       new Date().toISOString(),
+    exported_at:            new Date().toISOString(),
     instance: {
-      store_name:      req.instance!.store_name,
-      owner_name:      req.instance!.owner_name,
-      owner_mobile:    req.instance!.owner_mobile,
-      license_plan:    req.instance!.license_plan,
-      approval_status: req.instance!.approval_status,
+      store_name:           req.instance!.store_name,
+      owner_name:           req.instance!.owner_name,
+      owner_mobile:         req.instance!.owner_mobile,
+      license_plan:         req.instance!.license_plan,
+      approval_status:      req.instance!.approval_status,
     },
-    products:          structured.products          || [],
-    customers:         structured.customers         || [],
-    vendors:           structured.vendors           || [],
-    purchases:         structured.purchases         || [],
-    expenses:          structured.expenses          || [],
-    sales:             structured.sales?.length ? structured.sales : fallbackSales,
-    sale_items:        structured.sale_items        || [],
-    inventory_batches: structured.inventory_batches || [],
-    customer_payments: structured.customer_payments || [],
-    raw_events_count:  rawEvents.length,
+    // ── Core tables ─────────────────────────────────────────────────────────
+    products:               structured.product          || [],
+    customers:              structured.customer         || [],
+    vendors:                structured.vendor           || [],
+    expenses:               structured.expense          || [],
+    accounts:               structured.account          || [],
+    // ── Sales ───────────────────────────────────────────────────────────────
+    sales:                  structured.sale?.length     ? structured.sale     : fallbackSales,
+    sale_items:             structured.sale_item        || [],
+    sale_returns:           structured.sale_return      || [],
+    sale_return_items:      structured.sale_return_item || [],
+    // ── Purchases ───────────────────────────────────────────────────────────
+    purchases:              structured.purchase         || [],
+    inventory_batches:      structured.inventory_batch  || [],
+    purchase_returns:       structured.purchase_return  || [],
+    purchase_return_items:  structured.purchase_return_item || [],
+    // ── Payments ────────────────────────────────────────────────────────────
+    customer_payments:      structured.customer_payment || [],
+    vendor_payments:        structured.vendor_payment   || [],
+    account_txns:           structured.account_txn      || [],
+    financial_transactions: structured.financial_transaction || [],
+    // ── Meta ────────────────────────────────────────────────────────────────
+    raw_events_count:       rawEvents.length,
   });
 });
 
