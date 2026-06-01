@@ -18,29 +18,32 @@ const app  = express();
 const PORT = Number(process.env.PORT) || 5000;
 
 // ─── CORS (must come BEFORE helmet) ──────────────────────────────────────────
-// Supports '*' in ALLOWED_ORIGINS to permit all origins (useful for Railway).
-const allowedOrigins = (
-  process.env.ALLOWED_ORIGINS ||
-  'http://localhost:3001,http://localhost:5173, https://munibahmad-dev.github.io/pos-frontend-cloud/'
-).split(',').map(o => o.trim()).filter(Boolean);
+// Default: '*' (allow all). Set ALLOWED_ORIGINS in .env to restrict to specific
+// domains in production (comma-separated, supports '*' wildcard entry).
+// NOTE: defaults to '*' so deploys never silently break when .env isn't loaded.
+const _rawOrigins = (process.env.ALLOWED_ORIGINS || '*')
+  .split(',').map(o => o.trim()).filter(Boolean);
 
 const corsOptions: cors.CorsOptions = {
   origin: (origin, cb) => {
-    // No origin = same-origin or Electron (file://) — always allow
+    // No origin = same-origin, curl, Electron (file://) — always allow
     if (!origin) return cb(null, true);
-    // Wildcard in list = allow everything
-    if (allowedOrigins.includes('*')) return cb(null, true);
+    // Wildcard entry = allow everything
+    if (_rawOrigins.includes('*')) return cb(null, true);
     // Exact match
-    if (allowedOrigins.includes(origin)) return cb(null, true);
-    // Reject — use null false, NOT an Error, so CORS headers are still sent
+    if (_rawOrigins.includes(origin)) return cb(null, true);
+    // Vercel preview deployments (*.vercel.app) — always allow OsaTech previews
+    if (origin.endsWith('.vercel.app')) return cb(null, true);
+    // Reject without sending an Error object (browser still gets 200, just no CORS headers)
     cb(null, false);
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-setup-key'],
+  exposedHeaders: ['X-Request-Id'],
 };
 
-// Handle all preflight requests before any other middleware
+// Handle ALL preflight requests before any other middleware
 app.options('*', cors(corsOptions));
 app.use(cors(corsOptions));
 
