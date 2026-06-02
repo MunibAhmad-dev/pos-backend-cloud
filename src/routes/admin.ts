@@ -147,13 +147,14 @@ router.get('/stats', async (_req: Request, res: Response) => {
   const day1ago = new Date(now.getTime() - 86_400_000);
   const day7ago = new Date(now.getTime() - 7 * 86_400_000);
 
-  const [totalInstances, pending, blocked, approved, activeToday, activeWeek] = await Promise.all([
+  const [totalInstances, pending, blocked, approved, activeToday, activeWeek, pendingUploads] = await Promise.all([
     prisma.instance.count(),
     prisma.instance.count({ where: { approval_status: 'pending' } }),
     prisma.instance.count({ where: { approval_status: 'blocked' } }),
     prisma.instance.count({ where: { approval_status: 'approved' } }),
     prisma.instance.count({ where: { last_seen: { gte: day1ago } } }),
     prisma.instance.count({ where: { last_seen: { gte: day7ago } } }),
+    prisma.instance.count({ where: { db_upload_status: 'requested' } as any }),
   ]);
 
   const [revRow, salesRow, licensesIssued, licensesAssigned] = await Promise.all([
@@ -200,6 +201,7 @@ router.get('/stats', async (_req: Request, res: Response) => {
     success: true,
     data: {
       totalInstances, pending, blocked, approved, activeToday, activeWeek,
+      pendingUploads,   // stores waiting for DB upload approval
       totalRevenue:    Number(revRow._sum.total_revenue  || 0),
       totalSales:      Number(salesRow._sum.total_sales  || 0),
       licensesIssued, licensesAssigned,
@@ -469,6 +471,43 @@ router.post('/instances/:id/block', async (req: Request, res: Response) => {
   res.json({ success: true, message: `Instance ${req.params.id} cloud-blocked (legacy endpoint)` });
 });
 
+// ── DB Upload Request — Approve / Reject ──────────────────────────────────────
+/**
+ * POST /api/admin/instances/:id/approve-db-upload
+ * Grants the store owner permission to upload their full POS database.
+ */
+router.post('/instances/:id/approve-db-upload', async (req: Request, res: Response) => {
+  const inst = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
+  if (!inst) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  await prisma.instance.update({
+    where: { instance_id: req.params.id },
+    data:  { db_upload_status: 'approved' } as any,
+  });
+
+  res.json({ success: true, message: 'Database upload approved. The store owner can now proceed.' });
+});
+
+/**
+ * POST /api/admin/instances/:id/reject-db-upload
+ * Body: { reason?: string }
+ */
+router.post('/instances/:id/reject-db-upload', async (req: Request, res: Response) => {
+  const { reason } = req.body as { reason?: string };
+  const inst = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
+  if (!inst) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  await prisma.instance.update({
+    where: { instance_id: req.params.id },
+    data:  {
+      db_upload_status: 'rejected',
+      db_upload_note:   reason || 'Upload request rejected by admin.',
+    } as any,
+  });
+
+  res.json({ success: true, message: 'Database upload request rejected.' });
+});
+
 // ── Mobile Access Toggle ───────────────────────────────────────────────────────
 /**
  * POST /api/admin/instances/:id/mobile-access
@@ -552,6 +591,39 @@ router.get('/export-all', async (req: Request, res: Response) => {
   res.json({ exported_at: new Date().toISOString(), total_instances: instances.length, instances: exportData });
 });
 
+// ── Instance Settings (synced store config) ───────────────────────────────────
+router.get('/instances/:id/settings', async (req: Request, res: Response) => {
+  const instance = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
+  if (!instance) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  // Prefer settings synced via full-resync (entity_type='settings') for full detail
+  const settingsEvents = await parseEntityFromSync(req.params.id, 'settings');
+  const syncedSettings: any = settingsEvents[0] ?? null;
+
+  // Always return instance-level fields as fallback
+  res.json({
+    success: true,
+    data: {
+      // ── From instance registration / approval ─────────────────────────────
+      store_name:      syncedSettings?.store_name      || instance.store_name,
+      owner_name:      syncedSettings?.owner_full_name || instance.owner_name,
+      owner_mobile:    syncedSettings?.owner_mobile    || instance.owner_mobile,
+      owner_email:     syncedSettings?.owner_email     || instance.owner_email,
+      store_address:   syncedSettings?.store_address   || instance.store_address,
+      business_name:   syncedSettings?.business_name   || instance.business_name,
+      // ── From synced settings (only available if POS uploaded full data) ───
+      store_phone:     syncedSettings?.store_phone     || instance.owner_mobile || null,
+      receipt_footer:  syncedSettings?.receipt_footer  || null,
+      branch_name:     instance.branch_name,
+      license_plan:    instance.license_plan,
+      license_expiry:  instance.license_expiry,
+      app_version:     instance.app_version,
+      last_seen:       instance.last_seen,
+      synced_from_pos: !!syncedSettings,
+    },
+  });
+});
+
 // ── Products / customers / vendors / purchases / expenses / loans ──────────────
 router.get('/instances/:id/products', async (req: Request, res: Response) => {
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
@@ -626,8 +698,28 @@ router.get('/instances/:id/vendors', async (req: Request, res: Response) => {
 router.get('/instances/:id/purchases', async (req: Request, res: Response) => {
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
-  const items = (await parseEntityFromSync(req.params.id, 'purchase')).sort((a: any, b: any) => (b.date_created || '').localeCompare(a.date_created || ''));
-  res.json({ success: true, data: items, total: items.length });
+
+  const [purchases, vendors] = await Promise.all([
+    parseEntityFromSync(req.params.id, 'purchase'),
+    parseEntityFromSync(req.params.id, 'vendor'),
+  ]);
+
+  // Build vendor lookup: id → name
+  const vendorById = new Map<string, string>(
+    vendors.map((v: any) => [String(v.id ?? ''), v.name || '—'])
+  );
+
+  const enriched = purchases
+    .map((p: any) => ({
+      ...p,
+      // Normalise date: POS uses date_created, UI column expects 'date'
+      date:        p.date_created || p.date_added || p.date || null,
+      // Resolve vendor name from separate vendor sync events
+      vendor_name: vendorById.get(String(p.vendor_id ?? '')) || p.vendor_name || '—',
+    }))
+    .sort((a: any, b: any) => (b.date || '').localeCompare(a.date || ''));
+
+  res.json({ success: true, data: enriched, total: enriched.length });
 });
 
 router.get('/instances/:id/expenses', async (req: Request, res: Response) => {
@@ -665,7 +757,19 @@ router.get('/instances/:id/loans', async (req: Request, res: Response) => {
   }
 
   const customerLoans = customers
-    .map((c: any) => ({ ...c, balance: Math.round(Math.max(0, (salesByC.get(String(c.id ?? '')) ?? 0) - (cpByC.get(String(c.id ?? '')) ?? 0)) * 100) / 100 }))
+    .map((c: any) => {
+      const cid   = String(c.id ?? '');
+      const total = salesByC.get(cid) ?? 0;
+      const paid  = cpByC.get(cid)   ?? 0;
+      return {
+        ...c,
+        customer_id:   c.id,
+        customer_name: c.name || c.customer_name || '—',
+        total_amount:  Math.round(total * 100) / 100,
+        paid_amount:   Math.round(paid  * 100) / 100,
+        balance:       Math.round(Math.max(0, total - paid) * 100) / 100,
+      };
+    })
     .filter((c: any) => c.balance > 0)
     .sort((a: any, b: any) => b.balance - a.balance);
 
@@ -683,7 +787,19 @@ router.get('/instances/:id/loans', async (req: Request, res: Response) => {
   }
 
   const vendorLoans = vendors
-    .map((v: any) => ({ ...v, balance: Math.round(Math.max(0, (purchByV.get(String(v.id ?? '')) ?? 0) - (vpByV.get(String(v.id ?? '')) ?? 0)) * 100) / 100 }))
+    .map((v: any) => {
+      const vid   = String(v.id ?? '');
+      const total = purchByV.get(vid) ?? 0;
+      const paid  = vpByV.get(vid)   ?? 0;
+      return {
+        ...v,
+        vendor_id:   v.id,
+        vendor_name: v.name || v.vendor_name || '—',
+        total_amount: Math.round(total * 100) / 100,
+        paid_amount:  Math.round(paid  * 100) / 100,
+        balance:      Math.round(Math.max(0, total - paid) * 100) / 100,
+      };
+    })
     .filter((v: any) => v.balance > 0)
     .sort((a: any, b: any) => b.balance - a.balance);
 

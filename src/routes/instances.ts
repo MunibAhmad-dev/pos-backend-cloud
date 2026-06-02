@@ -107,18 +107,66 @@ router.post('/register', async (req: Request, res: Response) => {
 router.get('/status', requireInstance, (req: Request, res: Response) => {
   const inst = req.instance!;
   res.json({
-    success:         true,
-    instance_id:     inst.instance_id,
-    approval_status: inst.approval_status,
-    license_key:     inst.license_key || null,
-    license_plan:    inst.license_plan,
-    license_expiry:  inst.license_expiry,
-    license_revoked: inst.license_revoked || 0,
-    block_reason:    inst.block_reason || null,
-    store_name:      inst.store_name,
-    // Cloud-only soft block — sync is disabled but POS keeps running locally
-    cloud_blocked:   (inst as any).cloud_blocked ?? false,
+    success:          true,
+    instance_id:      inst.instance_id,
+    approval_status:  inst.approval_status,
+    license_key:      inst.license_key || null,
+    license_plan:     inst.license_plan,
+    license_expiry:   inst.license_expiry,
+    license_revoked:  inst.license_revoked || 0,
+    block_reason:     inst.block_reason || null,
+    store_name:       inst.store_name,
+    cloud_blocked:    (inst as any).cloud_blocked    ?? false,
+    db_upload_status: (inst as any).db_upload_status ?? 'none',
   });
+});
+
+/**
+ * POST /api/instances/request-db-upload   [instanceAuth]
+ * Body: { note?: string }
+ *
+ * Store owner asks admin permission to upload their full database.
+ * Creates a pending request the admin can approve/reject from the dashboard.
+ */
+router.post('/request-db-upload', requireInstance, async (req: Request, res: Response) => {
+  const inst = req.instance!;
+  const { note } = req.body as { note?: string };
+
+  const current = (inst as any).db_upload_status ?? 'none';
+
+  // Already approved — no need to re-request
+  if (current === 'approved') {
+    res.json({ success: true, db_upload_status: 'approved', message: 'Upload already approved — proceed with the upload.' });
+    return;
+  }
+
+  await prisma.instance.update({
+    where: { instance_id: inst.instance_id },
+    data: {
+      db_upload_status: 'requested',
+      db_upload_note:   note?.trim() || '',
+    } as any,
+  });
+
+  res.json({
+    success:          true,
+    db_upload_status: 'requested',
+    message:          'Upload request sent. You will be notified when the admin approves it.',
+  });
+});
+
+/**
+ * POST /api/instances/complete-db-upload   [instanceAuth]
+ *
+ * Called by the POS after a successful upload to reset the request status.
+ */
+router.post('/complete-db-upload', requireInstance, async (req: Request, res: Response) => {
+  const inst = req.instance!;
+  await prisma.instance.update({
+    where: { instance_id: inst.instance_id },
+    data:  { db_upload_status: 'none', db_upload_note: '' } as any,
+  });
+  res.json({ success: true, db_upload_status: 'none', message: 'Upload marked complete.' });
 });
 
 /**
@@ -144,15 +192,16 @@ router.post('/heartbeat', requireInstance, async (req: Request, res: Response) =
   const updated = await prisma.instance.findUnique({
     where:  { instance_id: inst.instance_id },
     select: { approval_status: true, license_plan: true, license_expiry: true,
-              block_reason: true, cloud_blocked: true },
+              block_reason: true, cloud_blocked: true, db_upload_status: true },
   });
 
   res.json({
-    success:         true,
-    approval_status: updated?.approval_status,
-    license_plan:    updated?.license_plan,
-    license_expiry:  updated?.license_expiry,
-    cloud_blocked:   updated?.cloud_blocked ?? false,
+    success:          true,
+    approval_status:  updated?.approval_status,
+    license_plan:     updated?.license_plan,
+    license_expiry:   updated?.license_expiry,
+    cloud_blocked:    updated?.cloud_blocked    ?? false,
+    db_upload_status: (updated as any)?.db_upload_status ?? 'none',
     message: updated?.approval_status === 'blocked'
                ? (updated.block_reason || 'Account blocked')
                : (updated?.cloud_blocked ? (updated.block_reason || 'Cloud sync blocked by administrator') : null),

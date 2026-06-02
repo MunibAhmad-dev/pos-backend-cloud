@@ -35,6 +35,8 @@ model Instance {
   branch_name        String    @default("Main Branch")
   mobile_access      Boolean   @default(false)   // admin toggles this to allow mobile app login
   cloud_blocked      Boolean   @default(false)   // soft-block: sync disabled, POS still runs locally
+  db_upload_status   String    @default("none")  // none | requested | approved | rejected
+  db_upload_note     String    @default("")      // reason/note from the store owner
   created_at         DateTime  @default(now())
   updated_at         DateTime  @updatedAt
 
