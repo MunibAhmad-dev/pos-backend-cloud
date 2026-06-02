@@ -293,6 +293,85 @@ router.get('/instances', async (req: Request, res: Response) => {
   res.json({ success: true, data: rows, total });
 });
 
+// ── Delete single instance ────────────────────────────────────────────────────
+/**
+ * DELETE /api/admin/instances/:id
+ *
+ * Permanently deletes one store and ALL associated data:
+ *   sync_events, instance_sales, notification_reads.
+ * License keys are de-assigned (not deleted) so they can be reused.
+ */
+router.delete('/instances/:id', async (req: Request, res: Response) => {
+  const instanceId = req.params.id;
+  const inst = await prisma.instance.findUnique({ where: { instance_id: instanceId } });
+  if (!inst) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  // Confirmation header required to prevent accidental deletion
+  const confirm = req.headers['x-confirm-delete'];
+  if (confirm !== instanceId) {
+    res.status(400).json({
+      success: false,
+      error: 'Missing confirmation. Set header x-confirm-delete to the instance_id.',
+    });
+    return;
+  }
+
+  await prisma.$transaction([
+    // Orphan any license keys (keep the key itself — can be reassigned)
+    prisma.licenseKey.updateMany({
+      where: { instance_id: instanceId },
+      data:  { instance_id: null },
+    }),
+    // Delete all associated data
+    prisma.notificationRead.deleteMany({ where: { instance_id: instanceId } }),
+    prisma.syncEvent.deleteMany({ where: { instance_id: instanceId } }),
+    prisma.instanceSale.deleteMany({ where: { instance_id: instanceId } }),
+    // Finally delete the instance itself
+    prisma.instance.delete({ where: { instance_id: instanceId } }),
+  ]);
+
+  res.json({
+    success: true,
+    message: `Instance "${inst.store_name}" (${instanceId}) and all associated data permanently deleted.`,
+  });
+});
+
+// ── Delete ALL instances (nuclear reset) ──────────────────────────────────────
+/**
+ * DELETE /api/admin/instances
+ *
+ * Permanently deletes EVERY instance and ALL sync data.
+ * Requires confirmation phrase in x-confirm-delete header.
+ * Licenses, notifications, releases are NOT deleted.
+ */
+router.delete('/instances', async (req: Request, res: Response) => {
+  const confirm = req.headers['x-confirm-delete'];
+  if (confirm !== 'DELETE_ALL_INSTANCES') {
+    res.status(400).json({
+      success: false,
+      error: 'Send header x-confirm-delete: DELETE_ALL_INSTANCES to proceed.',
+    });
+    return;
+  }
+
+  const count = await prisma.instance.count();
+
+  await prisma.$transaction([
+    prisma.notificationRead.deleteMany({}),
+    prisma.syncEvent.deleteMany({}),
+    prisma.instanceSale.deleteMany({}),
+    // Unassign all license keys
+    prisma.licenseKey.updateMany({ where: {}, data: { instance_id: null } }),
+    prisma.instance.deleteMany({}),
+  ]);
+
+  res.json({
+    success: true,
+    message: `All ${count} instances and their data have been permanently deleted.`,
+    deleted: count,
+  });
+});
+
 // ── Instance detail ────────────────────────────────────────────────────────────
 router.get('/instances/:id', async (req: Request, res: Response) => {
   const instance = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
