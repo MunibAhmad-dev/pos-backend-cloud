@@ -56,15 +56,40 @@ router.post('/', requireInstance, async (req: Request, res: Response) => {
         try {
           const payloadStr = JSON.stringify(item.payload || {});
 
-          // Always store the raw event
-          await tx.syncEvent.create({
-            data: {
-              instance_id: inst.instance_id,
-              entity_type: item.entity_type,
-              operation:   item.operation,
-              payload:     payloadStr,
-            },
-          });
+          // Store the raw event — but skip exact duplicates to keep sync_events lean.
+          // Two events are considered identical when:
+          //   same instance + entity_type + operation + entity_id + payload content
+          // Duplicates arise when the POS runs full-resync multiple times.
+          const entityId = String(
+            item.payload?.id ?? item.payload?.barcode ?? item.payload?.name ?? ''
+          );
+
+          let skipEvent = false;
+          if (entityId && item.operation === 'create') {
+            // Check if the latest create event for this entity has the exact same payload
+            const [dup] = await tx.$queryRaw<[{ cnt: bigint }]>(Prisma.sql`
+              SELECT COUNT(*)::int AS cnt
+              FROM   sync_events
+              WHERE  instance_id = ${inst.instance_id}
+                AND  entity_type = ${item.entity_type}
+                AND  operation   = 'create'
+                AND  payload::jsonb->>'id'      IS NOT DISTINCT FROM ${entityId}
+                AND  payload = ${payloadStr}
+              LIMIT 1
+            `);
+            if (Number(dup?.cnt ?? 0) > 0) skipEvent = true;
+          }
+
+          if (!skipEvent) {
+            await tx.syncEvent.create({
+              data: {
+                instance_id: inst.instance_id,
+                entity_type: item.entity_type,
+                operation:   item.operation,
+                payload:     payloadStr,
+              },
+            });
+          }
 
           // Flatten sale creates into instance_sales (upsert — idempotent on re-sync)
           if (item.entity_type === 'sale' && item.operation === 'create') {

@@ -362,21 +362,32 @@ router.get('/sync-status', requireInstance, async (req: Request, res: Response) 
 router.post('/mobile-token', requireInstance, async (req: Request, res: Response) => {
   const inst = req.instance!;
 
-  if (inst.approval_status !== 'approved') {
-    res.status(403).json({ success: false, error: 'Instance not yet approved' });
+  // pending = waiting for admin to approve the store
+  if (inst.approval_status === 'pending') {
+    res.status(403).json({
+      success:   false,
+      error:     'pending',
+      message:   'Your store is pending approval. Please contact OsaTech admin to approve your store first.',
+    });
     return;
   }
 
-  // Fetch latest mobile_access flag from DB
+  // Fetch latest mobile_access flag fresh from DB (admin may have just toggled it)
   const row = await prisma.instance.findUnique({
-    where: { instance_id: inst.instance_id },
-    select: { mobile_access: true, store_name: true, owner_mobile: true },
+    where:  { instance_id: inst.instance_id },
+    select: { mobile_access: true, store_name: true, owner_mobile: true, approval_status: true },
   });
 
-  if (!row?.mobile_access) {
+  if (!row) {
+    res.status(404).json({ success: false, error: 'Instance not found' });
+    return;
+  }
+
+  if (!row.mobile_access) {
     res.status(403).json({
       success: false,
-      error: 'Mobile access not enabled for this store. Ask your admin to enable it.',
+      error:   'mobile_not_enabled',
+      message: 'Mobile app access is not enabled for your store. Contact OsaTech admin to enable it from the admin panel.',
     });
     return;
   }
