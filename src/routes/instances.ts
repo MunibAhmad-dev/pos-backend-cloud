@@ -505,4 +505,140 @@ router.get('/mobile-status', requireInstance, async (req: Request, res: Response
   res.json({ success: true, mobile_access: !!row?.mobile_access });
 });
 
+/**
+ * GET /api/instances/dashboard   [instanceAuth]
+ *
+ * Lightweight dashboard KPIs for this store only.
+ */
+router.get('/dashboard', requireInstance, async (req: Request, res: Response) => {
+  const instanceId = req.instance!.instance_id;
+  const inst = req.instance!;
+
+  // Sales from instance_sales table (fast)
+  const allSales = await prisma.instanceSale.findMany({
+    where: { instance_id: instanceId },
+    select: { total_amount: true, date_created: true },
+  });
+
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+  const todayRevenue = allSales
+    .filter(s => new Date(s.date_created) >= todayStart)
+    .reduce((sum, s) => sum + Number(s.total_amount || 0), 0);
+
+  const monthRevenue = allSales
+    .filter(s => new Date(s.date_created) >= monthStart)
+    .reduce((sum, s) => sum + Number(s.total_amount || 0), 0);
+
+  const totalRevenue = allSales.reduce((sum, s) => sum + Number(s.total_amount || 0), 0);
+  const totalSales = allSales.length;
+
+  // Counts from sync_events
+  const counts = await prisma.syncEvent.groupBy({
+    by: ['entity_type'],
+    where: { instance_id: instanceId, operation: { not: 'delete' } },
+    _count: { _all: true },
+  });
+  const countMap: Record<string, number> = {};
+  for (const c of counts) countMap[c.entity_type] = c._count._all;
+
+  res.json({
+    success: true,
+    data: {
+      store_name:      inst.store_name,
+      approval_status: inst.approval_status,
+      license_plan:    inst.license_plan,
+      license_expiry:  inst.license_expiry,
+      today_revenue:   todayRevenue,
+      month_revenue:   monthRevenue,
+      total_revenue:   totalRevenue,
+      total_sales:     totalSales,
+      total_products:  inst.total_products  ?? countMap['product']  ?? 0,
+      total_customers: inst.total_customers ?? countMap['customer'] ?? 0,
+    },
+  });
+});
+
+/**
+ * GET /api/instances/analytics   [instanceAuth]
+ * Query: date_from, date_to (ISO strings, optional)
+ *
+ * Store-scoped analytics: sales trend, top products, P&L.
+ */
+router.get('/analytics', requireInstance, async (req: Request, res: Response) => {
+  const instanceId = req.instance!.instance_id;
+  const { date_from, date_to } = req.query as Record<string, string>;
+
+  const from = date_from ? new Date(date_from) : new Date(Date.now() - 30 * 86400000);
+  const to   = date_to   ? new Date(date_to)   : new Date();
+
+  // Sales by day
+  const sales = await prisma.instanceSale.findMany({
+    where: {
+      instance_id: instanceId,
+      date_created: { gte: from, lte: to },
+    },
+    select: { total_amount: true, date_created: true },
+    orderBy: { date_created: 'asc' },
+  });
+
+  const salesByDayMap: Record<string, { revenue: number; count: number }> = {};
+  for (const s of sales) {
+    const day = new Date(s.date_created).toISOString().slice(0, 10);
+    if (!salesByDayMap[day]) salesByDayMap[day] = { revenue: 0, count: 0 };
+    salesByDayMap[day].revenue += Number(s.total_amount || 0);
+    salesByDayMap[day].count   += 1;
+  }
+  const salesByDay = Object.entries(salesByDayMap).map(([day, v]) => ({ day, ...v }));
+
+  // Top products from sync_events
+  const productEvents = await prisma.syncEvent.findMany({
+    where: { instance_id: instanceId, entity_type: 'sale_item' },
+    select: { payload: true },
+  });
+
+  const productMap: Record<string, { name: string; quantity: number; revenue: number }> = {};
+  for (const e of productEvents) {
+    try {
+      const p = JSON.parse(e.payload) as any;
+      const key = String(p.product_id || p.name || '');
+      if (!key) continue;
+      if (!productMap[key]) productMap[key] = { name: p.product_name || p.name || key, quantity: 0, revenue: 0 };
+      productMap[key].quantity += Number(p.quantity || 0);
+      productMap[key].revenue  += Number(p.total || p.subtotal || 0);
+    } catch { continue; }
+  }
+  const topProducts = Object.entries(productMap)
+    .map(([id, v]) => ({ product_id: id, ...v }))
+    .sort((a, b) => b.revenue - a.revenue)
+    .slice(0, 10);
+
+  // Expenses from sync_events
+  const expenseEvents = await prisma.syncEvent.findMany({
+    where: { instance_id: instanceId, entity_type: 'expense', operation: { not: 'delete' } },
+    select: { payload: true },
+  });
+  const totalExpenses = expenseEvents.reduce((sum, e) => {
+    try { return sum + Number((JSON.parse(e.payload) as any).amount || 0); } catch { return sum; }
+  }, 0);
+
+  const totalRevenue = sales.reduce((sum, s) => sum + Number(s.total_amount || 0), 0);
+
+  res.json({
+    success: true,
+    data: {
+      salesByDay,
+      topProducts,
+      totals: {
+        revenue:  totalRevenue,
+        sales:    sales.length,
+        expenses: totalExpenses,
+        profit:   totalRevenue - totalExpenses,
+      },
+    },
+  });
+});
+
 export default router;
