@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
+import { Prisma } from '@prisma/client';
 import prisma from '../db';
 import { requireInstance } from '../middleware/instanceAuth';
 import { signMobileToken } from '../middleware/auth';
@@ -348,6 +349,37 @@ router.get('/export', requireInstance, async (req: Request, res: Response) => {
     // ── Meta ────────────────────────────────────────────────────────────────
     raw_events_count:       rawEvents.length,
   });
+});
+
+// ─── Cloud entity counts ─────────────────────────────────────────────────────
+/**
+ * GET /api/instances/cloud-counts   [instanceAuth]
+ *
+ * Returns the count of DISTINCT entities in the cloud for each entity type.
+ * Uses DISTINCT deduplication (latest event wins per entity id) so the number
+ * matches what "Fetch from Cloud" would actually restore.
+ */
+router.get('/cloud-counts', requireInstance, async (req: Request, res: Response) => {
+  const instanceId = req.instance!.instance_id;
+
+  // Count distinct entity IDs per type (payload->>'id' as the dedup key)
+  const rows = await prisma.$queryRaw<Array<{ entity_type: string; distinct_count: bigint }>>(
+    Prisma.sql`
+      SELECT entity_type,
+             COUNT(DISTINCT (payload::jsonb)->>'id') AS distinct_count
+      FROM   sync_events
+      WHERE  instance_id = ${instanceId}
+        AND  operation   != 'delete'
+      GROUP  BY entity_type
+    `
+  );
+
+  const counts: Record<string, number> = {};
+  for (const row of rows) {
+    counts[row.entity_type] = Number(row.distinct_count ?? 0);
+  }
+
+  res.json({ success: true, data: counts });
 });
 
 // ─── Sync Status (for POS Settings "What's backed up") ───────────────────────
