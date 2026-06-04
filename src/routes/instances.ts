@@ -517,7 +517,7 @@ router.get('/dashboard', requireInstance, async (req: Request, res: Response) =>
   // Sales from instance_sales table (fast)
   const allSales = await prisma.instanceSale.findMany({
     where: { instance_id: instanceId },
-    select: { total_amount: true, date_created: true },
+    select: { total: true, date_created: true },
   });
 
   const now = new Date();
@@ -525,14 +525,14 @@ router.get('/dashboard', requireInstance, async (req: Request, res: Response) =>
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
 
   const todayRevenue = allSales
-    .filter(s => new Date(s.date_created) >= todayStart)
-    .reduce((sum, s) => sum + Number(s.total_amount || 0), 0);
+    .filter(s => s.date_created && new Date(s.date_created) >= todayStart)
+    .reduce((sum, s) => sum + Number(s.total || 0), 0);
 
   const monthRevenue = allSales
-    .filter(s => new Date(s.date_created) >= monthStart)
-    .reduce((sum, s) => sum + Number(s.total_amount || 0), 0);
+    .filter(s => s.date_created && new Date(s.date_created) >= monthStart)
+    .reduce((sum, s) => sum + Number(s.total || 0), 0);
 
-  const totalRevenue = allSales.reduce((sum, s) => sum + Number(s.total_amount || 0), 0);
+  const totalRevenue = allSales.reduce((sum, s) => sum + Number(s.total || 0), 0);
   const totalSales = allSales.length;
 
   // Counts from sync_events
@@ -574,21 +574,22 @@ router.get('/analytics', requireInstance, async (req: Request, res: Response) =>
   const from = date_from ? new Date(date_from) : new Date(Date.now() - 30 * 86400000);
   const to   = date_to   ? new Date(date_to)   : new Date();
 
-  // Sales by day
+  // Sales by day — date_created is string|null so filter nulls and use string comparison
   const sales = await prisma.instanceSale.findMany({
     where: {
       instance_id: instanceId,
-      date_created: { gte: from, lte: to },
+      date_created: { gte: from.toISOString(), lte: to.toISOString() },
     },
-    select: { total_amount: true, date_created: true },
+    select: { total: true, date_created: true },
     orderBy: { date_created: 'asc' },
   });
 
   const salesByDayMap: Record<string, { revenue: number; count: number }> = {};
   for (const s of sales) {
-    const day = new Date(s.date_created).toISOString().slice(0, 10);
+    if (!s.date_created) continue;
+    const day = s.date_created.slice(0, 10);
     if (!salesByDayMap[day]) salesByDayMap[day] = { revenue: 0, count: 0 };
-    salesByDayMap[day].revenue += Number(s.total_amount || 0);
+    salesByDayMap[day].revenue += Number(s.total || 0);
     salesByDayMap[day].count   += 1;
   }
   const salesByDay = Object.entries(salesByDayMap).map(([day, v]) => ({ day, ...v }));
@@ -624,7 +625,7 @@ router.get('/analytics', requireInstance, async (req: Request, res: Response) =>
     try { return sum + Number((JSON.parse(e.payload) as any).amount || 0); } catch { return sum; }
   }, 0);
 
-  const totalRevenue = sales.reduce((sum, s) => sum + Number(s.total_amount || 0), 0);
+  const totalRevenue = sales.reduce((sum, s) => sum + Number(s.total || 0), 0);
 
   res.json({
     success: true,
