@@ -884,8 +884,60 @@ router.get('/instances/:id/purchases', async (req: Request, res: Response) => {
 router.get('/instances/:id/expenses', async (req: Request, res: Response) => {
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
-  const items = (await parseEntityFromSync(req.params.id, 'expense')).sort((a: any, b: any) => (b.date_added || b.date_created || '').localeCompare(a.date_added || a.date_created || ''));
-  res.json({ success: true, data: items, total: items.length });
+
+  const [expenses, employees] = await Promise.all([
+    parseEntityFromSync(req.params.id, 'expense'),
+    parseEntityFromSync(req.params.id, 'employee'),
+  ]);
+
+  const expenseRows = expenses
+    .map((e: any) => ({ ...e, _type: 'expense' }))
+    .sort((a: any, b: any) => (b.date_added || b.date_created || '').localeCompare(a.date_added || a.date_created || ''));
+
+  const employeeRows = employees
+    .map((e: any) => ({ ...e, _type: 'employee' }))
+    .sort((a: any, b: any) => (a.name || '').localeCompare(b.name || ''));
+
+  res.json({ success: true, data: expenseRows, employees: employeeRows,
+             total: expenseRows.length, totalEmployees: employeeRows.length });
+});
+
+// ── Accounts & Cash ────────────────────────────────────────────────────────────
+router.get('/instances/:id/accounts', async (req: Request, res: Response) => {
+  const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
+  if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  const [accounts, txns, registers] = await Promise.all([
+    parseEntityFromSync(req.params.id, 'account'),
+    parseEntityFromSync(req.params.id, 'account_txn'),
+    parseEntityFromSync(req.params.id, 'register'),
+  ]);
+
+  // Compute current balance per account from txns
+  const balanceMap = new Map<string, number>();
+  for (const acc of accounts) {
+    balanceMap.set(String(acc.id), parseFloat(acc.opening_balance) || 0);
+  }
+  for (const txn of txns) {
+    const id = String(txn.account_id ?? '');
+    if (!id) continue;
+    const current = balanceMap.get(id) ?? 0;
+    const amount  = parseFloat(txn.amount) || 0;
+    balanceMap.set(id, current + (txn.type === 'in' ? amount : -amount));
+  }
+
+  const accountsWithBalance = accounts.map((acc: any) => ({
+    ...acc,
+    computed_balance: Math.round((balanceMap.get(String(acc.id)) ?? 0) * 100) / 100,
+  }));
+
+  res.json({
+    success:   true,
+    accounts:  accountsWithBalance,
+    txns:      txns.sort((a: any, b: any) => (b.date_created || '').localeCompare(a.date_created || '')),
+    registers: registers.sort((a: any, b: any) => (b.opened_at || '').localeCompare(a.opened_at || '')),
+    totalBalance: Math.round(accountsWithBalance.reduce((s: number, a: any) => s + a.computed_balance, 0) * 100) / 100,
+  });
 });
 
 router.get('/instances/:id/loans', async (req: Request, res: Response) => {
