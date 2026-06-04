@@ -670,6 +670,86 @@ router.get('/export-all', async (req: Request, res: Response) => {
   res.json({ exported_at: new Date().toISOString(), total_instances: instances.length, instances: exportData });
 });
 
+// ── Category-specific export ──────────────────────────────────────────────────
+/**
+ * GET /api/admin/instances/:id/export-category?cat=products
+ *
+ * Returns all synced data for a specific category as a structured JSON object.
+ * The admin can call this for each category and download the result.
+ */
+const CATEGORY_ENTITIES: Record<string, string[]> = {
+  products:  ['product', 'inventory_batch', 'stock_adjustment'],
+  sales:     ['sale', 'sale_item'],
+  customers: ['customer'],
+  vendors:   ['vendor'],
+  purchases: ['purchase', 'inventory_batch', 'purchase_return', 'purchase_return_item'],
+  returns:   ['sale_return', 'sale_return_item', 'purchase_return', 'purchase_return_item'],
+  loans:     ['customer_payment', 'vendor_payment'],
+  accounts:  ['account', 'account_txn', 'register', 'financial_transaction'],
+  expenses:  ['expense', 'employee'],
+  settings:  ['settings'],
+};
+
+// entity_type → table name mapping (singular → plural)
+const ENTITY_TABLE: Record<string, string> = {
+  product: 'products', inventory_batch: 'inventory_batches', stock_adjustment: 'stock_adjustments',
+  sale: 'sales', sale_item: 'sale_items',
+  customer: 'customers', vendor: 'vendors', employee: 'employees',
+  purchase: 'purchases', purchase_return: 'purchase_returns', purchase_return_item: 'purchase_return_items',
+  sale_return: 'sale_returns', sale_return_item: 'sale_return_items',
+  customer_payment: 'customer_payments', vendor_payment: 'vendor_payments',
+  account: 'accounts', account_txn: 'account_txns', register: 'registers',
+  financial_transaction: 'financial_transactions', settings: 'settings', entity_history: 'entity_history',
+};
+
+router.get('/instances/:id/export-category', async (req: Request, res: Response) => {
+  const cat = String(req.query.cat || '');
+  const entityTypes = CATEGORY_ENTITIES[cat];
+  if (!entityTypes) {
+    res.status(400).json({ success: false, error: `Unknown category "${cat}". Valid: ${Object.keys(CATEGORY_ENTITIES).join(', ')}` });
+    return;
+  }
+
+  const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true, store_name: true } });
+  if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  // Fetch all events for this instance that match the category's entity types
+  const events = await prisma.syncEvent.findMany({
+    where: { instance_id: req.params.id, entity_type: { in: entityTypes } },
+    orderBy: { id: 'asc' },
+  });
+
+  // Deduplicate — latest wins, deletes remove the entry
+  const entityMap: Record<string, Map<string, any>> = {};
+  for (const ev of events) {
+    const type = ev.entity_type;
+    if (!entityMap[type]) entityMap[type] = new Map();
+    let payload: any = null;
+    try { payload = JSON.parse(ev.payload); } catch { continue; }
+    if (!payload) continue;
+    const key = String(payload?.id ?? payload?.barcode ?? ev.id);
+    if (ev.operation === 'delete') entityMap[type].delete(key);
+    else entityMap[type].set(key, payload);
+  }
+
+  // Build response with table names as keys
+  const result: Record<string, any[]> = {};
+  for (const entityType of entityTypes) {
+    const tableName = ENTITY_TABLE[entityType] || entityType;
+    result[tableName] = Array.from((entityMap[entityType] ?? new Map()).values());
+  }
+
+  res.json({
+    success:      true,
+    category:     cat,
+    instance_id:  req.params.id,
+    store_name:   exists.store_name,
+    exported_at:  new Date().toISOString(),
+    data:         result,
+    record_count: Object.values(result).reduce((s, v) => s + v.length, 0),
+  });
+});
+
 // ── Instance Settings (synced store config) ───────────────────────────────────
 router.get('/instances/:id/settings', async (req: Request, res: Response) => {
   const instance = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
