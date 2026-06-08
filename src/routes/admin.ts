@@ -66,6 +66,61 @@ async function parseEntityFromSync(instanceId: string, entityType: string): Prom
   return Array.from(map.values());
 }
 
+function toNumber(value: unknown): number {
+  if (value == null || value === '') return 0;
+  const n = Number(String(value).replace(/,/g, ''));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function getFirstNumber(source: Record<string, any>, keys: string[]): number {
+  for (const key of keys) {
+    const n = toNumber(source[key]);
+    if (n > 0) return n;
+  }
+  return 0;
+}
+
+function calculateInventoryStats(products: any[]) {
+  return products.reduce(
+    (acc, product) => {
+      const stock = Math.max(0, getFirstNumber(product, [
+        'stock',
+        'quantity',
+        'qty',
+        'current_stock',
+        'stock_quantity',
+        'available_stock',
+      ]));
+      const cost = getFirstNumber(product, [
+        'purchase_price',
+        'cost_price',
+        'buying_price',
+        'wholesale_price',
+        'unit_cost',
+        'cost',
+      ]);
+      const salePrice = getFirstNumber(product, ['price', 'sale_price', 'selling_price', 'retail_price']);
+      const valueAtCost = stock * cost;
+      const valueAtSale = stock * salePrice;
+
+      acc.totalStock += stock;
+      acc.stockValue += valueAtCost;
+      acc.retailValue += valueAtSale;
+      if (stock <= 0) acc.outOfStock += 1;
+      if (stock > 0 && stock <= 5) acc.lowStock += 1;
+      return acc;
+    },
+    {
+      totalProducts: products.length,
+      totalStock: 0,
+      stockValue: 0,
+      retailValue: 0,
+      lowStock: 0,
+      outOfStock: 0,
+    },
+  );
+}
+
 // ─── Export-all helper ────────────────────────────────────────────────────────
 // Maps singular entity_type (used in sync_events) → plural SQLite table name.
 // Must be kept in sync with full-resync entity types in main.ts.
@@ -377,7 +432,7 @@ router.get('/instances/:id', async (req: Request, res: Response) => {
   const instance = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
   if (!instance) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
 
-  const [recentEvents, salesStats] = await Promise.all([
+  const [recentEvents, salesStats, products] = await Promise.all([
     prisma.syncEvent.findMany({
       where:   { instance_id: req.params.id },
       orderBy: { id: 'desc' },
@@ -390,13 +445,17 @@ router.get('/instances/:id', async (req: Request, res: Response) => {
       _sum:    { total: true },
       _max:    { date_created: true },
     }),
+    parseEntityFromSync(req.params.id, 'product'),
   ]);
+
+  const inventoryStats = calculateInventoryStats(products);
 
   res.json({
     success: true,
     data: {
       instance,
       recentEvents,
+      inventoryStats,
       salesStats: {
         total_synced_sales: salesStats._count.id,
         synced_revenue:     salesStats._sum.total,
@@ -787,7 +846,18 @@ router.get('/instances/:id/settings', async (req: Request, res: Response) => {
 router.get('/instances/:id/products', async (req: Request, res: Response) => {
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
-  const products = (await parseEntityFromSync(req.params.id, 'product')).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  const products = (await parseEntityFromSync(req.params.id, 'product'))
+    .map((product) => {
+      const stock = Math.max(0, getFirstNumber(product, ['stock', 'quantity', 'qty', 'current_stock', 'stock_quantity', 'available_stock']));
+      const cost = getFirstNumber(product, ['purchase_price', 'cost_price', 'buying_price', 'wholesale_price', 'unit_cost', 'cost']);
+      const salePrice = getFirstNumber(product, ['price', 'sale_price', 'selling_price', 'retail_price']);
+      return {
+        ...product,
+        stock_value: Math.round(stock * cost * 100) / 100,
+        retail_stock_value: Math.round(stock * salePrice * 100) / 100,
+      };
+    })
+    .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
   res.json({ success: true, data: products, total: products.length });
 });
 
