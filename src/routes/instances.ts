@@ -53,7 +53,42 @@ router.post('/register', async (req: Request, res: Response) => {
     });
   }
 
-  // New instance — resolve license if provided
+  // ── Mobile-number fallback ────────────────────────────────────────────────
+  // A fresh install generates a NEW instance_id (UUID), so findUnique above
+  // won't match the previously-approved record. Avoid creating a duplicate
+  // pending entry by looking up the most-recent instance for this mobile number.
+  const existingByMobile = await prisma.instance.findFirst({
+    where:   { owner_mobile: owner_mobile.trim() },
+    orderBy: { created_at: 'desc' },
+  });
+  if (existingByMobile) {
+    await prisma.instance.update({
+      where: { instance_id: existingByMobile.instance_id },
+      data: {
+        store_name:         store_name    || undefined,
+        owner_name:         owner_name    || undefined,
+        owner_email:        owner_email   || undefined,
+        store_address:      store_address || undefined,
+        business_name:      business_name || undefined,
+        device_fingerprint: fingerprint   || undefined,
+        app_version:        app_version   || undefined,
+        branch_name:        branch_name   || undefined,
+        last_seen:          new Date(),
+      },
+    });
+    return res.json({
+      success:         true,
+      api_key:         existingByMobile.api_key,
+      instance_id:     existingByMobile.instance_id,   // tell client to re-anchor to this ID
+      approval_status: existingByMobile.approval_status,
+      license_plan:    existingByMobile.license_plan,
+      license_expiry:  existingByMobile.license_expiry,
+      message:         'Existing instance reconnected via mobile number.',
+    });
+  }
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // Genuinely new instance — resolve license if provided
   const api_key = uuidv4();
   let license_plan   = 'none';
   let license_expiry: string | null = null;
