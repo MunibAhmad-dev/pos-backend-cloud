@@ -6,21 +6,33 @@ import prisma from '../db';
 import { requireAdmin } from '../middleware/auth';
 import '../types';
 
-// ─── License keygen (same AES-256-GCM algorithm as POS client) ───────────────
-const LICENSE_SECRET = Buffer.from(
-  '4a616e75617279203173742c2032303236204c6963656e736520536563726574',
-  'hex',
-);
+// ─── License keygen — V3 format matching POS client license_manager.ts ──────
+// Format: iv:authTag:ciphertext:hmac  (4 parts — POS rejects anything else)
+// Keys must match the POS client exactly. Load from env — never hardcode.
 const IV_LENGTH = 12;
+const _licAesKey  = () => {
+  const k = Buffer.from(process.env.OSATEC_AES_KEY_HEX  || '', 'hex');
+  if (k.length !== 32) throw new Error('OSATEC_AES_KEY_HEX missing or wrong length (need 64 hex chars)');
+  return k;
+};
+const _licHmacKey = () => {
+  const k = Buffer.from(process.env.OSATEC_HMAC_KEY_HEX || '', 'hex');
+  if (k.length !== 32) throw new Error('OSATEC_HMAC_KEY_HEX missing or wrong length (need 64 hex chars)');
+  return k;
+};
 
 interface LicensePayload {
+  v: 3;                          // Version marker — POS rejects v !== 3
   id: string; issuedTo: string; issuedForFingerprint: string;
   durationDays: number; maxDevices: number; issuedAt: string; expiresAt: string;
 }
 
 function generateLicenseKey(params: {
-  issuedTo: string; fingerprint: string; plan: string; durationDays?: number;
+  issuedTo: string; fingerprint?: string; plan: string; durationDays?: number;
 }): { licenseKey: string; expiresAt: string | null } {
+  const aes  = _licAesKey();
+  const hmac = _licHmacKey();
+
   const planDays: Record<string, number> = { monthly: 30, quarterly: 90, yearly: 365, lifetime: 36500 };
   const days     = params.durationDays || planDays[params.plan] || 30;
   const now      = new Date();
@@ -28,9 +40,10 @@ function generateLicenseKey(params: {
   const expiresAt = params.plan === 'lifetime' ? null : expires.toISOString();
 
   const payload: LicensePayload = {
+    v:                    3,                                // required by POS client
     id:                   uuidv4(),
     issuedTo:             params.issuedTo?.trim() || 'Unknown Business',
-    issuedForFingerprint: params.fingerprint ?? '',
+    issuedForFingerprint: params.fingerprint?.trim() || '*', // '*' = admin-issued, device not pre-bound
     durationDays:         days,
     maxDevices:           1,
     issuedAt:             now.toISOString(),
@@ -38,12 +51,16 @@ function generateLicenseKey(params: {
   };
 
   const iv = crypto.randomBytes(IV_LENGTH);
-  const cipher = crypto.createCipheriv('aes-256-gcm', LICENSE_SECRET, iv);
+  const cipher = crypto.createCipheriv('aes-256-gcm', aes, iv);
   let encrypted = cipher.update(JSON.stringify(payload), 'utf8', 'hex');
   encrypted += cipher.final('hex');
   const authTag = cipher.getAuthTag().toString('hex');
 
-  return { licenseKey: `${iv.toString('hex')}:${authTag}:${encrypted}`, expiresAt };
+  // Outer HMAC-SHA256 over iv:authTag:ciphertext (POS verifies this before AES)
+  const body = `${iv.toString('hex')}:${authTag}:${encrypted}`;
+  const mac  = crypto.createHmac('sha256', hmac).update(body).digest('hex');
+
+  return { licenseKey: `${body}:${mac}`, expiresAt };
 }
 
 // ─── Entity-from-sync helper ──────────────────────────────────────────────────
@@ -538,35 +555,51 @@ router.get('/instances/:id/license-preview', async (req: Request, res: Response)
 });
 
 // ── Unblock license ────────────────────────────────────────────────────────────
+// Always regenerates a fresh key (correct format) instead of restoring the old
+// stale one — old keys may have been generated before the V3 format fix.
 router.post('/instances/:id/unblock-license', async (req: Request, res: Response) => {
   const inst = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
   if (!inst) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
 
-  const restoredKey = await prisma.licenseKey.findFirst({
-    where:   { instance_id: req.params.id, is_active: false },
+  // Find the most recent (possibly stale) key for plan/duration info — but do NOT restore it
+  const prevKey = await prisma.licenseKey.findFirst({
+    where:   { instance_id: req.params.id },
     orderBy: { issued_at: 'desc' },
   });
 
-  if (restoredKey) {
-    await prisma.licenseKey.update({ where: { license_key: restoredKey.license_key }, data: { is_active: true } });
-    await prisma.instance.update({
+  const plan         = prevKey?.plan          || (inst as any).license_plan || 'monthly';
+  const durationDays = prevKey?.duration_days || 30;
+  const issuedTo     = (inst.store_name || inst.business_name || '').trim() || 'Unknown Business';
+
+  // Generate a fresh key in the correct V3 format
+  const generated = generateLicenseKey({ issuedTo, plan, durationDays });
+  const newLicenseKey = generated.licenseKey;
+  const newExpiresAt  = generated.expiresAt;
+
+  await prisma.$transaction([
+    // Deactivate all previous keys for this instance
+    prisma.licenseKey.updateMany({
+      where: { instance_id: req.params.id },
+      data:  { is_active: false },
+    }),
+    // Insert the new correct key
+    prisma.licenseKey.create({
+      data: { license_key: newLicenseKey, instance_id: req.params.id, plan, duration_days: durationDays, expires_at: newExpiresAt, notes: 'Regenerated on unblock' },
+    }),
+    // Restore approval with the new key
+    prisma.instance.update({
       where: { instance_id: req.params.id },
       data: {
         approval_status: 'approved', license_revoked: 0, block_reason: '',
-        cloud_blocked:   false,  // lifting license block also lifts cloud block
-        license_key:    restoredKey.license_key,
-        license_plan:   restoredKey.plan || 'standard',
-        license_expiry: restoredKey.expires_at || null,
+        cloud_blocked:   false,
+        license_key:     newLicenseKey,
+        license_plan:    plan,
+        license_expiry:  newExpiresAt,
       },
-    });
-    res.json({ success: true, message: 'License unblocked and restored.', license_key: restoredKey.license_key, license_plan: restoredKey.plan });
-  } else {
-    await prisma.instance.update({
-      where: { instance_id: req.params.id },
-      data: { approval_status: 'approved', license_revoked: 0, block_reason: '', cloud_blocked: false },
-    });
-    res.json({ success: true, message: 'License unblocked (no previous key to restore). Use Approve to issue a new license key.' });
-  }
+    }),
+  ]);
+
+  res.json({ success: true, message: 'License unblocked with a fresh key.', license_key: newLicenseKey, license_plan: plan, expires_at: newExpiresAt });
 });
 
 // ── Cloud-only block (soft block) ─────────────────────────────────────────────
