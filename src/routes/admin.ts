@@ -483,41 +483,50 @@ router.get('/instances/:id', async (req: Request, res: Response) => {
 });
 
 // ── Approve ────────────────────────────────────────────────────────────────────
+// NOTE: Express 4 does NOT auto-forward async rejections to the error handler.
+// Every async route MUST have its own try/catch, otherwise a throw (e.g. from
+// generateLicenseKey when env keys are missing, or a Prisma error) will leave
+// the response permanently open and the client will time-out after 30 s.
 router.post('/instances/:id/approve', async (req: Request, res: Response) => {
-  const { plan, duration_days, notes } = req.body as { plan?: string; duration_days?: number; notes?: string };
-  const instanceId = req.params.id;
+  try {
+    const { plan, duration_days, notes } = req.body as { plan?: string; duration_days?: number; notes?: string };
+    const instanceId = req.params.id;
 
-  const existing = await prisma.instance.findUnique({ where: { instance_id: instanceId } });
-  if (!existing) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+    const existing = await prisma.instance.findUnique({ where: { instance_id: instanceId } });
+    if (!existing) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
 
-  let licenseKey: string | null = null;
-  let expiresAt:  string | null = null;
-  const resolvedPlan = plan || null;
+    let licenseKey: string | null = null;
+    let expiresAt:  string | null = null;
+    const resolvedPlan = plan || null;
 
-  if (plan) {
-    const defaultDays: Record<string, number> = { monthly: 30, quarterly: 90, yearly: 365, lifetime: 36500 };
-    const days = Number(duration_days) || defaultDays[plan] || 30;
-    const issuedTo = (existing.store_name || existing.business_name || '').trim() || 'Unknown Business';
-    const generated = generateLicenseKey({ issuedTo, fingerprint: '', plan, durationDays: days });
-    licenseKey = generated.licenseKey;
-    expiresAt  = generated.expiresAt;
+    if (plan) {
+      const defaultDays: Record<string, number> = { monthly: 30, quarterly: 90, yearly: 365, lifetime: 36500 };
+      const days = Number(duration_days) || defaultDays[plan] || 30;
+      const issuedTo = (existing.store_name || existing.business_name || '').trim() || 'Unknown Business';
+      const generated = generateLicenseKey({ issuedTo, fingerprint: '', plan, durationDays: days });
+      licenseKey = generated.licenseKey;
+      expiresAt  = generated.expiresAt;
 
-    await prisma.licenseKey.create({
-      data: { license_key: licenseKey, instance_id: instanceId, plan, duration_days: days, expires_at: expiresAt, notes: notes || '' },
+      await prisma.licenseKey.create({
+        data: { license_key: licenseKey, instance_id: instanceId, plan, duration_days: days, expires_at: expiresAt, notes: notes || '' },
+      });
+    }
+
+    await prisma.instance.update({
+      where: { instance_id: instanceId },
+      data: {
+        approval_status: 'approved',
+        block_reason:    '',
+        license_revoked: 0,
+        ...(licenseKey ? { license_key: licenseKey, license_plan: resolvedPlan!, license_expiry: expiresAt } : {}),
+      },
     });
+
+    res.json({ success: true, message: `Instance ${instanceId} approved`, licenseKey, plan: resolvedPlan, expiresAt });
+  } catch (e: any) {
+    console.error('[approve]', e.message);
+    res.status(500).json({ success: false, error: e.message || 'Approval failed' });
   }
-
-  await prisma.instance.update({
-    where: { instance_id: instanceId },
-    data: {
-      approval_status: 'approved',
-      block_reason:    '',
-      license_revoked: 0,
-      ...(licenseKey ? { license_key: licenseKey, license_plan: resolvedPlan!, license_expiry: expiresAt } : {}),
-    },
-  });
-
-  res.json({ success: true, message: `Instance ${instanceId} approved`, licenseKey, plan: resolvedPlan, expiresAt });
 });
 
 // ── Block license ──────────────────────────────────────────────────────────────
@@ -558,48 +567,53 @@ router.get('/instances/:id/license-preview', async (req: Request, res: Response)
 // Always regenerates a fresh key (correct format) instead of restoring the old
 // stale one — old keys may have been generated before the V3 format fix.
 router.post('/instances/:id/unblock-license', async (req: Request, res: Response) => {
-  const inst = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
-  if (!inst) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+  try {
+    const inst = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
+    if (!inst) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
 
-  // Find the most recent (possibly stale) key for plan/duration info — but do NOT restore it
-  const prevKey = await prisma.licenseKey.findFirst({
-    where:   { instance_id: req.params.id },
-    orderBy: { issued_at: 'desc' },
-  });
+    // Find the most recent (possibly stale) key for plan/duration info — but do NOT restore it
+    const prevKey = await prisma.licenseKey.findFirst({
+      where:   { instance_id: req.params.id },
+      orderBy: { issued_at: 'desc' },
+    });
 
-  const plan         = prevKey?.plan          || (inst as any).license_plan || 'monthly';
-  const durationDays = prevKey?.duration_days || 30;
-  const issuedTo     = (inst.store_name || inst.business_name || '').trim() || 'Unknown Business';
+    const plan         = prevKey?.plan          || (inst as any).license_plan || 'monthly';
+    const durationDays = prevKey?.duration_days || 30;
+    const issuedTo     = (inst.store_name || inst.business_name || '').trim() || 'Unknown Business';
 
-  // Generate a fresh key in the correct V3 format
-  const generated = generateLicenseKey({ issuedTo, plan, durationDays });
-  const newLicenseKey = generated.licenseKey;
-  const newExpiresAt  = generated.expiresAt;
+    // Generate a fresh key in the correct V3 format
+    const generated = generateLicenseKey({ issuedTo, plan, durationDays });
+    const newLicenseKey = generated.licenseKey;
+    const newExpiresAt  = generated.expiresAt;
 
-  await prisma.$transaction([
-    // Deactivate all previous keys for this instance
-    prisma.licenseKey.updateMany({
-      where: { instance_id: req.params.id },
-      data:  { is_active: false },
-    }),
-    // Insert the new correct key
-    prisma.licenseKey.create({
-      data: { license_key: newLicenseKey, instance_id: req.params.id, plan, duration_days: durationDays, expires_at: newExpiresAt, notes: 'Regenerated on unblock' },
-    }),
-    // Restore approval with the new key
-    prisma.instance.update({
-      where: { instance_id: req.params.id },
-      data: {
-        approval_status: 'approved', license_revoked: 0, block_reason: '',
-        cloud_blocked:   false,
-        license_key:     newLicenseKey,
-        license_plan:    plan,
-        license_expiry:  newExpiresAt,
-      },
-    }),
-  ]);
+    await prisma.$transaction([
+      // Deactivate all previous keys for this instance
+      prisma.licenseKey.updateMany({
+        where: { instance_id: req.params.id },
+        data:  { is_active: false },
+      }),
+      // Insert the new correct key
+      prisma.licenseKey.create({
+        data: { license_key: newLicenseKey, instance_id: req.params.id, plan, duration_days: durationDays, expires_at: newExpiresAt, notes: 'Regenerated on unblock' },
+      }),
+      // Restore approval with the new key
+      prisma.instance.update({
+        where: { instance_id: req.params.id },
+        data: {
+          approval_status: 'approved', license_revoked: 0, block_reason: '',
+          cloud_blocked:   false,
+          license_key:     newLicenseKey,
+          license_plan:    plan,
+          license_expiry:  newExpiresAt,
+        },
+      }),
+    ]);
 
-  res.json({ success: true, message: 'License unblocked with a fresh key.', license_key: newLicenseKey, license_plan: plan, expires_at: newExpiresAt });
+    res.json({ success: true, message: 'License unblocked with a fresh key.', license_key: newLicenseKey, license_plan: plan, expires_at: newExpiresAt });
+  } catch (e: any) {
+    console.error('[unblock-license]', e.message);
+    res.status(500).json({ success: false, error: e.message || 'Unblock failed' });
+  }
 });
 
 // ── Cloud-only block (soft block) ─────────────────────────────────────────────
@@ -1409,24 +1423,29 @@ router.get('/licenses', async (_req: Request, res: Response) => {
 });
 
 router.post('/licenses', async (req: Request, res: Response) => {
-  const { plan, duration_days, notes, instance_id } = req.body as { plan: string; duration_days?: number; notes?: string; instance_id?: string };
-  if (!plan) { res.status(400).json({ success: false, error: 'plan is required' }); return; }
+  try {
+    const { plan, duration_days, notes, instance_id } = req.body as { plan: string; duration_days?: number; notes?: string; instance_id?: string };
+    if (!plan) { res.status(400).json({ success: false, error: 'plan is required' }); return; }
 
-  const days      = Number(duration_days) || 30;
-  const generated = generateLicenseKey({ issuedTo: 'Unknown Business', fingerprint: '', plan, durationDays: days });
+    const days      = Number(duration_days) || 30;
+    const generated = generateLicenseKey({ issuedTo: 'Unknown Business', fingerprint: '', plan, durationDays: days });
 
-  const key = await prisma.licenseKey.create({
-    data: { license_key: generated.licenseKey, instance_id: instance_id || null, plan, duration_days: days, expires_at: generated.expiresAt, notes: notes || '' },
-  });
-
-  if (instance_id) {
-    await prisma.instance.update({
-      where: { instance_id },
-      data:  { license_key: generated.licenseKey, license_plan: plan, license_expiry: generated.expiresAt },
+    const key = await prisma.licenseKey.create({
+      data: { license_key: generated.licenseKey, instance_id: instance_id || null, plan, duration_days: days, expires_at: generated.expiresAt, notes: notes || '' },
     });
-  }
 
-  res.status(201).json({ success: true, data: { id: key.id, license_key: generated.licenseKey, plan, duration_days: days, expires_at: generated.expiresAt } });
+    if (instance_id) {
+      await prisma.instance.update({
+        where: { instance_id },
+        data:  { license_key: generated.licenseKey, license_plan: plan, license_expiry: generated.expiresAt },
+      });
+    }
+
+    res.status(201).json({ success: true, data: { id: key.id, license_key: generated.licenseKey, plan, duration_days: days, expires_at: generated.expiresAt } });
+  } catch (e: any) {
+    console.error('[create-license]', e.message);
+    res.status(500).json({ success: false, error: e.message || 'License creation failed' });
+  }
 });
 
 router.post('/licenses/:key/assign', async (req: Request, res: Response) => {
