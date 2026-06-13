@@ -467,10 +467,13 @@ router.get('/instances/:id', async (req: Request, res: Response) => {
 
   const inventoryStats = calculateInventoryStats(products);
 
+  // Strip password_hash from the payload — never expose it; send a boolean flag instead
+  const { password_hash, ...instanceSafe } = instance as any;
+
   res.json({
     success: true,
     data: {
-      instance,
+      instance: { ...instanceSafe, has_password: !!(password_hash) },
       recentEvents,
       inventoryStats,
       salesStats: {
@@ -480,6 +483,29 @@ router.get('/instances/:id', async (req: Request, res: Response) => {
       },
     },
   });
+});
+
+// ── Set / reset customer password ─────────────────────────────────────────────
+router.post('/instances/:id/set-password', async (req: Request, res: Response) => {
+  try {
+    const { password } = req.body as { password?: string };
+    if (!password || password.trim().length < 4) {
+      res.status(400).json({ success: false, error: 'Password must be at least 4 characters' });
+      return;
+    }
+    const inst = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
+    if (!inst) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+    const hash = await (await import('bcryptjs')).hash(password.trim(), 10);
+    await prisma.instance.update({
+      where: { instance_id: req.params.id },
+      data:  { password_hash: hash },
+    });
+    res.json({ success: true, message: 'Password updated' });
+  } catch (e: any) {
+    console.error('[set-password]', e.message);
+    res.status(500).json({ success: false, error: e.message || 'Failed to set password' });
+  }
 });
 
 // ── Approve ────────────────────────────────────────────────────────────────────

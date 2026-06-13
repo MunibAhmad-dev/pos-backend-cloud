@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
+import bcrypt from 'bcryptjs';
 import prisma from '../db';
 
 const router = Router();
@@ -12,7 +13,8 @@ const router = Router();
  * Idempotent — returns existing api_key if already registered (same mobile + branch).
  */
 router.post('/register-business', async (req: Request, res: Response) => {
-  const { businessName, ownerName, mobile, email, address, fingerprint, branchName } = req.body as Record<string, string>;
+  const { businessName, ownerName, mobile, email, address, fingerprint, branchName, password } =
+    req.body as Record<string, string>;
 
   if (!mobile) {
     res.status(400).json({ success: false, error: 'mobile is required' });
@@ -28,26 +30,43 @@ router.post('/register-business', async (req: Request, res: Response) => {
     });
 
     if (existing) {
-      // Update fingerprint if it changed
-      if (fingerprint && fingerprint !== existing.device_fingerprint) {
-        await prisma.instance.update({
-          where: { instance_id: existing.instance_id },
-          data: { device_fingerprint: fingerprint.trim() },
-        });
+      // If this instance has a password set, the caller must provide the correct one
+      if (existing.password_hash && password) {
+        const ok = await bcrypt.compare(password, existing.password_hash);
+        if (!ok) {
+          res.status(401).json({ success: false, error: 'Incorrect password' });
+          return;
+        }
+      } else if (existing.password_hash && !password) {
+        // Has a password but none was provided — tell the client a password is required
+        res.status(401).json({ success: false, error: 'Password required for this account' });
+        return;
       }
+
+      const updateData: Record<string, any> = {};
+      if (fingerprint && fingerprint !== existing.device_fingerprint)
+        updateData.device_fingerprint = fingerprint.trim();
+      // If no password was set before and one is provided now, set it
+      if (!existing.password_hash && password)
+        updateData.password_hash = await bcrypt.hash(password, 10);
+
+      if (Object.keys(updateData).length)
+        await prisma.instance.update({ where: { instance_id: existing.instance_id }, data: updateData });
+
       res.json({
         success: true,
-        instance_id: existing.instance_id,
-        api_key: existing.api_key,
+        instance_id:     existing.instance_id,
+        api_key:         existing.api_key,
         approval_status: existing.approval_status,
         message: 'Already registered',
       });
       return;
     }
 
-    // New branch — each branch gets its own UUID
-    const instance_id = uuidv4();
-    const api_key     = uuidv4();
+    // New registration
+    const instance_id   = uuidv4();
+    const api_key       = uuidv4();
+    const password_hash = password ? await bcrypt.hash(password, 10) : '';
 
     await prisma.instance.create({
       data: {
@@ -62,6 +81,7 @@ router.post('/register-business', async (req: Request, res: Response) => {
         device_fingerprint: fingerprint    || '',
         branch_name:        branch,
         approval_status:    'pending',
+        password_hash,
       },
     });
 
