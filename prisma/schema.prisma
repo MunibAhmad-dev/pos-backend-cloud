@@ -163,3 +163,23 @@ model NotificationRead {
   @@map("notification_reads")
   @@id([notification_id, instance_id])
 }
+
+model BranchRequest {
+  id          Int      @id @default(autoincrement())
+  instance_id String
+  branch_name String
+  phone       String   @default("")
+  address     String   @default("")
+  city        String   @default("")
+  notes       String   @default("")
+  status      String   @default("pending")  // pending | approved | rejected
+  branch_code String   @default("")
+  branch_id   String   @default("")
+  admin_note  String   @default("")
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  @@map("branch_requests")
+  @@index([instance_id])
+  @@index([status])
+}

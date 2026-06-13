@@ -1752,4 +1752,117 @@ router.delete('/releases/:id', async (req: Request, res: Response) => {
   res.json({ success: true, message: 'Release deleted' });
 });
 
+// ─── Branch Requests ─────────────────────────────────────────────────────────
+
+/**
+ * GET /api/admin/branch-requests
+ * List all branch requests, newest first.
+ * Query: ?status=pending|approved|rejected
+ */
+router.get('/branch-requests', async (req: Request, res: Response) => {
+  const { status } = req.query as Record<string, string>;
+  const where: any = {};
+  if (status) where.status = status;
+
+  const requests = await prisma.branchRequest.findMany({
+    where,
+    orderBy: { created_at: 'desc' },
+  });
+
+  // Enrich with store_name
+  const instanceIds = [...new Set(requests.map(r => r.instance_id))];
+  const instances = await prisma.instance.findMany({
+    where:  { instance_id: { in: instanceIds } },
+    select: { instance_id: true, store_name: true, owner_mobile: true },
+  });
+  const instMap = new Map(instances.map(i => [i.instance_id, i]));
+
+  const enriched = requests.map(r => ({
+    ...r,
+    store_name:   instMap.get(r.instance_id)?.store_name   ?? r.instance_id,
+    owner_mobile: instMap.get(r.instance_id)?.owner_mobile ?? '',
+  }));
+
+  res.json({ success: true, data: enriched, total: enriched.length });
+});
+
+/**
+ * PATCH /api/admin/branch-requests/:id/approve
+ * Approve a branch request — generate a unique branch_code and branch_id.
+ * Body: { admin_note? }
+ */
+router.patch('/branch-requests/:id/approve', async (req: Request, res: Response) => {
+  try {
+    const id   = Number(req.params.id);
+    const { admin_note = '' } = req.body as { admin_note?: string };
+
+    const request = await prisma.branchRequest.findUnique({ where: { id } });
+    if (!request) {
+      res.status(404).json({ success: false, error: 'Branch request not found' });
+      return;
+    }
+    if (request.status !== 'pending') {
+      res.status(409).json({ success: false, error: `Request is already ${request.status}` });
+      return;
+    }
+
+    // Generate a short unique branch code: BR-XXXXXX
+    const branchCode = `BR-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+    const branchId   = uuidv4();
+
+    const updated = await prisma.branchRequest.update({
+      where: { id },
+      data:  {
+        status:      'approved',
+        branch_code: branchCode,
+        branch_id:   branchId,
+        admin_note:  admin_note.trim(),
+      },
+    });
+
+    res.json({
+      success:     true,
+      message:     `Branch request approved — code: ${branchCode}`,
+      data:        updated,
+      branch_code: branchCode,
+      branch_id:   branchId,
+    });
+  } catch (e: any) {
+    console.error('[branch-requests/approve]', e.message);
+    res.status(500).json({ success: false, error: e.message || 'Approval failed' });
+  }
+});
+
+/**
+ * PATCH /api/admin/branch-requests/:id/reject
+ * Reject a branch request.
+ * Body: { admin_note? }
+ */
+router.patch('/branch-requests/:id/reject', async (req: Request, res: Response) => {
+  try {
+    const id   = Number(req.params.id);
+    const { admin_note = '' } = req.body as { admin_note?: string };
+
+    const request = await prisma.branchRequest.findUnique({ where: { id } });
+    if (!request) {
+      res.status(404).json({ success: false, error: 'Branch request not found' });
+      return;
+    }
+    if (request.status !== 'pending') {
+      res.status(409).json({ success: false, error: `Request is already ${request.status}` });
+      return;
+    }
+
+    const updated = await prisma.branchRequest.update({
+      where: { id },
+      data:  { status: 'rejected', admin_note: admin_note.trim() },
+    });
+
+    res.json({ success: true, message: 'Branch request rejected', data: updated });
+  } catch (e: any) {
+    console.error('[branch-requests/reject]', e.message);
+    res.status(500).json({ success: false, error: e.message || 'Rejection failed' });
+  }
+});
+
 export default router;

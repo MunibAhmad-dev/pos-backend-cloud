@@ -72,6 +72,10 @@ router.post('/register-business', async (req: Request, res: Response) => {
         instance_id:     existing.instance_id,
         api_key:         existing.api_key,
         approval_status: existing.approval_status,
+        store_name:      existing.store_name    || '',
+        owner_name:      existing.owner_name    || '',
+        store_address:   existing.store_address || '',
+        owner_email:     existing.owner_email   || '',
         message: 'Already registered',
       });
       return;
