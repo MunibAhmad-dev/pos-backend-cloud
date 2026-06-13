@@ -410,6 +410,7 @@ router.get('/branches', requireInstance, async (req: Request, res: Response) => 
       last_seen:      true,
       app_version:    true,
       total_sales:    true,
+      total_revenue:  true,
     } as any,
   });
 
