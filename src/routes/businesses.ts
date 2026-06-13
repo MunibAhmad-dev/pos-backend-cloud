@@ -13,7 +13,7 @@ const router = Router();
  * Idempotent — returns existing api_key if already registered (same mobile + branch).
  */
 router.post('/register-business', async (req: Request, res: Response) => {
-  const { businessName, ownerName, mobile, email, address, fingerprint, branchName, password, mode } =
+  const { businessName, ownerName, mobile, email, address, fingerprint, branchName, password, mode, branchCode } =
     req.body as Record<string, string>;
 
   // mode: 'register' (new account) | 'signin' (restore existing) — defaults to 'signin' for
@@ -25,7 +25,31 @@ router.post('/register-business', async (req: Request, res: Response) => {
     return;
   }
 
-  const branch = (branchName || 'Main Branch').trim();
+  // ── Branch registration: validate branch_code and resolve parent ──────────
+  let parentInstanceId = '';
+  let branchDisplayName = (branchName || 'Main Branch').trim();
+  let autoApprove = false;
+
+  if (branchCode) {
+    const branchReq = await prisma.branchRequest.findFirst({
+      where: { branch_code: branchCode.trim(), status: 'approved' },
+    });
+    if (!branchReq) {
+      res.status(400).json({ success: false, error: 'Invalid or unrecognised branch code. Ask your main store owner for the correct code.' });
+      return;
+    }
+    // Reject if another instance already consumed this branch code
+    const alreadyUsed = await prisma.instance.findFirst({ where: { branch_code: branchCode.trim() } });
+    if (alreadyUsed) {
+      res.status(409).json({ success: false, error: 'This branch code has already been used to register another device.' });
+      return;
+    }
+    parentInstanceId  = branchReq.instance_id;
+    branchDisplayName = branchReq.branch_name;
+    autoApprove       = true;
+  }
+
+  const branch = autoApprove ? branchDisplayName : (branchName || 'Main Branch').trim();
 
   try {
     // Look up by mobile + branch
@@ -99,18 +123,23 @@ router.post('/register-business', async (req: Request, res: Response) => {
         store_name:         businessName   || '',
         device_fingerprint: fingerprint    || '',
         branch_name:        branch,
-        approval_status:    'pending',
+        approval_status:    autoApprove ? 'approved' : 'pending',
         password_hash,
         password_plain,
-      },
+        parent_instance_id: parentInstanceId,
+        branch_code:        branchCode?.trim() || '',
+      } as any,
     });
 
     res.status(201).json({
-      success: true,
+      success:         true,
       instance_id,
       api_key,
-      approval_status: 'pending',
-      message: 'Registration received. Awaiting admin approval.',
+      approval_status: autoApprove ? 'approved' : 'pending',
+      parent_instance_id: parentInstanceId || undefined,
+      message: autoApprove
+        ? 'Branch registered successfully. Your store is ready to use.'
+        : 'Registration received. Awaiting admin approval.',
     });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });

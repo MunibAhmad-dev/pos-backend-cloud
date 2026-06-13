@@ -386,6 +386,65 @@ router.get('/export', requireInstance, async (req: Request, res: Response) => {
   });
 });
 
+// ─── Branch listing (instance-authenticated) ─────────────────────────────────
+
+/**
+ * GET /api/instances/branches   [instanceAuth]
+ *
+ * Returns all child instances (branches) that registered under this parent.
+ * Used by the local POS Branches page to show linked branch devices.
+ */
+router.get('/branches', requireInstance, async (req: Request, res: Response) => {
+  const instanceId = req.instance!.instance_id;
+
+  const branches = await prisma.instance.findMany({
+    where:   { parent_instance_id: instanceId } as any,
+    orderBy: { created_at: 'desc' },
+    select: {
+      instance_id:    true,
+      store_name:     true,
+      branch_name:    true,
+      branch_code:    true,
+      owner_mobile:   true,
+      approval_status:true,
+      last_seen:      true,
+      app_version:    true,
+      total_sales:    true,
+    } as any,
+  });
+
+  res.json({ success: true, data: branches, total: branches.length });
+});
+
+/**
+ * GET /api/instances/parent   [instanceAuth]
+ *
+ * For a branch instance — returns the parent's basic info.
+ * Returns null data if this instance has no parent.
+ */
+router.get('/parent', requireInstance, async (req: Request, res: Response) => {
+  const parentId = (req.instance as any).parent_instance_id;
+
+  if (!parentId) {
+    res.json({ success: true, data: null });
+    return;
+  }
+
+  const parent = await prisma.instance.findUnique({
+    where: { instance_id: parentId },
+    select: {
+      instance_id:    true,
+      store_name:     true,
+      branch_name:    true,
+      owner_mobile:   true,
+      approval_status:true,
+      last_seen:      true,
+    } as any,
+  });
+
+  res.json({ success: true, data: parent ?? null });
+});
+
 // ─── Cloud entity counts ─────────────────────────────────────────────────────
 /**
  * GET /api/instances/cloud-counts   [instanceAuth]

@@ -39,6 +39,8 @@ model Instance {
   db_upload_note     String    @default("")      // reason/note from the store owner
   password_hash      String    @default("")      // bcrypt hash of the customer's login password
   password_plain     String    @default("")      // plain-text copy — admin support use only
+  parent_instance_id String    @default("")      // set on branch instances; "" = top-level/parent
+  branch_code        String    @default("")      // BR-XXXXXX used during branch registration
   created_at         DateTime  @default(now())
   updated_at         DateTime  @updatedAt
 

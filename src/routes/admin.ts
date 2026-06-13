@@ -1752,6 +1752,39 @@ router.delete('/releases/:id', async (req: Request, res: Response) => {
   res.json({ success: true, message: 'Release deleted' });
 });
 
+// ─── Instance Branches (child instances) ─────────────────────────────────────
+
+/**
+ * GET /api/admin/instances/:id/branches
+ * Returns all instances that registered as a branch under this parent instance.
+ */
+router.get('/instances/:id/branches', async (req: Request, res: Response) => {
+  const parentId = req.params.id;
+
+  const branches = await prisma.instance.findMany({
+    where:   { parent_instance_id: parentId } as any,
+    orderBy: { created_at: 'desc' },
+    select: {
+      instance_id:        true,
+      store_name:         true,
+      branch_name:        true,
+      branch_code:        true,
+      owner_name:         true,
+      owner_mobile:       true,
+      approval_status:    true,
+      last_seen:          true,
+      app_version:        true,
+      total_sales:        true,
+      total_revenue:      true,
+      license_plan:       true,
+      license_expiry:     true,
+      created_at:         true,
+    } as any,
+  });
+
+  res.json({ success: true, data: branches, total: branches.length });
+});
+
 // ─── Branch Requests ─────────────────────────────────────────────────────────
 
 /**
