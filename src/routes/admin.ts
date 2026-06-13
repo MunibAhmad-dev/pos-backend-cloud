@@ -467,13 +467,17 @@ router.get('/instances/:id', async (req: Request, res: Response) => {
 
   const inventoryStats = calculateInventoryStats(products);
 
-  // Strip password_hash from the payload — never expose it; send a boolean flag instead
-  const { password_hash, ...instanceSafe } = instance as any;
+  // Strip password_hash; keep password_plain for admin support viewing
+  const { password_hash, password_plain, ...instanceSafe } = instance as any;
 
   res.json({
     success: true,
     data: {
-      instance: { ...instanceSafe, has_password: !!(password_hash) },
+      instance: {
+        ...instanceSafe,
+        has_password:     !!(password_hash),
+        current_password: password_plain || '',   // plain-text — admin eyes only
+      },
       recentEvents,
       inventoryStats,
       salesStats: {
@@ -499,7 +503,7 @@ router.post('/instances/:id/set-password', async (req: Request, res: Response) =
     const hash = await (await import('bcryptjs')).hash(password.trim(), 10);
     await prisma.instance.update({
       where: { instance_id: req.params.id },
-      data:  { password_hash: hash },
+      data:  { password_hash: hash, password_plain: password.trim() },
     });
     res.json({ success: true, message: 'Password updated' });
   } catch (e: any) {

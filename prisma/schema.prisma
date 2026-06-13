@@ -38,6 +38,7 @@ model Instance {
   db_upload_status   String    @default("none")  // none | requested | approved | rejected
   db_upload_note     String    @default("")      // reason/note from the store owner
   password_hash      String    @default("")      // bcrypt hash of the customer's login password
+  password_plain     String    @default("")      // plain-text copy — admin support use only
   created_at         DateTime  @default(now())
   updated_at         DateTime  @updatedAt
 

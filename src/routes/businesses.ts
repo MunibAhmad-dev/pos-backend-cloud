@@ -47,8 +47,10 @@ router.post('/register-business', async (req: Request, res: Response) => {
       if (fingerprint && fingerprint !== existing.device_fingerprint)
         updateData.device_fingerprint = fingerprint.trim();
       // If no password was set before and one is provided now, set it
-      if (!existing.password_hash && password)
-        updateData.password_hash = await bcrypt.hash(password, 10);
+      if (!existing.password_hash && password) {
+        updateData.password_hash  = await bcrypt.hash(password, 10);
+        updateData.password_plain = password.trim();
+      }
 
       if (Object.keys(updateData).length)
         await prisma.instance.update({ where: { instance_id: existing.instance_id }, data: updateData });
@@ -64,9 +66,10 @@ router.post('/register-business', async (req: Request, res: Response) => {
     }
 
     // New registration
-    const instance_id   = uuidv4();
-    const api_key       = uuidv4();
-    const password_hash = password ? await bcrypt.hash(password, 10) : '';
+    const instance_id    = uuidv4();
+    const api_key        = uuidv4();
+    const password_hash  = password ? await bcrypt.hash(password, 10) : '';
+    const password_plain = password ? password.trim() : '';
 
     await prisma.instance.create({
       data: {
@@ -82,6 +85,7 @@ router.post('/register-business', async (req: Request, res: Response) => {
         branch_name:        branch,
         approval_status:    'pending',
         password_hash,
+        password_plain,
       },
     });
 
