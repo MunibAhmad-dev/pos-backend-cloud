@@ -13,8 +13,12 @@ const router = Router();
  * Idempotent — returns existing api_key if already registered (same mobile + branch).
  */
 router.post('/register-business', async (req: Request, res: Response) => {
-  const { businessName, ownerName, mobile, email, address, fingerprint, branchName, password } =
+  const { businessName, ownerName, mobile, email, address, fingerprint, branchName, password, mode } =
     req.body as Record<string, string>;
+
+  // mode: 'register' (new account) | 'signin' (restore existing) — defaults to 'signin' for
+  // backwards compat with old POS clients that don't send the field
+  const isRegister = mode === 'register';
 
   if (!mobile) {
     res.status(400).json({ success: false, error: 'mobile is required' });
@@ -24,13 +28,23 @@ router.post('/register-business', async (req: Request, res: Response) => {
   const branch = (branchName || 'Main Branch').trim();
 
   try {
-    // Idempotent — same mobile + branch returns the existing record
+    // Look up by mobile + branch
     const existing = await prisma.instance.findFirst({
       where: { owner_mobile: mobile.trim(), branch_name: branch },
     });
 
     if (existing) {
-      // If this instance has a password set, the caller must provide the correct one
+      // ── Register mode: block if account already has a password set ──────────
+      // The customer should use Sign In to restore access, not create a new account.
+      if (isRegister && existing.password_hash) {
+        res.status(409).json({
+          success: false,
+          error: 'Account already exists. Please use Sign In to restore access.',
+        });
+        return;
+      }
+
+      // ── Sign-in / idempotent re-registration ─────────────────────────────────
       if (existing.password_hash && password) {
         const ok = await bcrypt.compare(password, existing.password_hash);
         if (!ok) {
@@ -38,7 +52,6 @@ router.post('/register-business', async (req: Request, res: Response) => {
           return;
         }
       } else if (existing.password_hash && !password) {
-        // Has a password but none was provided — tell the client a password is required
         res.status(401).json({ success: false, error: 'Password required for this account' });
         return;
       }
@@ -46,7 +59,6 @@ router.post('/register-business', async (req: Request, res: Response) => {
       const updateData: Record<string, any> = {};
       if (fingerprint && fingerprint !== existing.device_fingerprint)
         updateData.device_fingerprint = fingerprint.trim();
-      // If no password was set before and one is provided now, set it
       if (!existing.password_hash && password) {
         updateData.password_hash  = await bcrypt.hash(password, 10);
         updateData.password_plain = password.trim();
