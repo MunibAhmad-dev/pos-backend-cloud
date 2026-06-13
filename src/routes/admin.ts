@@ -1760,9 +1760,10 @@ router.delete('/releases/:id', async (req: Request, res: Response) => {
  * Query: ?status=pending|approved|rejected
  */
 router.get('/branch-requests', async (req: Request, res: Response) => {
-  const { status } = req.query as Record<string, string>;
+  const { status, instance_id } = req.query as Record<string, string>;
   const where: any = {};
-  if (status) where.status = status;
+  if (status)      where.status      = status;
+  if (instance_id) where.instance_id = instance_id;
 
   const requests = await prisma.branchRequest.findMany({
     where,
