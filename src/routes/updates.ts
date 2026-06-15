@@ -3,7 +3,10 @@
  * Called by the POS Electron app to discover new versions.
  */
 import { Router, Request, Response } from 'express';
+import path from 'path';
+import fs from 'fs';
 import prisma from '../db';
+import { RELEASES_DIR } from '../lib/releases';
 
 const router = Router();
 
@@ -56,6 +59,25 @@ router.get('/latest', async (req: Request, res: Response) => {
       published_at: latest.created_at,
     },
   });
+});
+
+/**
+ * GET /api/updates/download/:file
+ *
+ * Streams an uploaded installer to the POS app. Public (no auth) so the
+ * updater can fetch it directly. The filename is sanitised to block path
+ * traversal — only files inside RELEASES_DIR can be served.
+ */
+router.get('/download/:file', (req: Request, res: Response) => {
+  const name = path.basename(String(req.params.file || ''));
+  const full = path.resolve(RELEASES_DIR, name);
+
+  if (!full.startsWith(path.resolve(RELEASES_DIR)) || !fs.existsSync(full)) {
+    res.status(404).json({ success: false, error: 'Installer not found' });
+    return;
+  }
+  // res.download sets Content-Disposition: attachment + Content-Length.
+  res.download(full, name);
 });
 
 export default router;

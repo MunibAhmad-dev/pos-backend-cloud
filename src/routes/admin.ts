@@ -1,10 +1,34 @@
 import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
+import path from 'path';
+import fs from 'fs';
+import multer from 'multer';
 import { Prisma } from '@prisma/client';
 import prisma from '../db';
 import { requireAdmin } from '../middleware/auth';
+import { RELEASES_DIR } from '../lib/releases';
 import '../types';
+
+// ─── Release installer upload (multipart) ───────────────────────────────────
+// Stores the uploaded .exe/.msi on the VPS so the backend itself hosts the
+// download — no external URL needed.
+fs.mkdirSync(RELEASES_DIR, { recursive: true });
+
+const releaseUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, RELEASES_DIR),
+    filename: (_req, file, cb) => {
+      const safe = file.originalname.replace(/[^\w.\-]+/g, '_');
+      cb(null, `${Date.now()}-${safe}`);
+    },
+  }),
+  limits: { fileSize: 600 * 1024 * 1024 }, // 600 MB ceiling
+  fileFilter: (_req, file, cb) => {
+    const ok = /\.(exe|msi|zip|dmg|appimage)$/i.test(file.originalname);
+    cb(null, ok);
+  },
+});
 
 // ─── License keygen — V3 format matching POS client license_manager.ts ──────
 // Format: iv:authTag:ciphertext:hmac  (4 parts — POS rejects anything else)
@@ -1692,6 +1716,32 @@ router.post('/seed-demo', async (_req: Request, res: Response) => {
 router.get('/releases', async (_req: Request, res: Response) => {
   const releases = await prisma.appRelease.findMany({ orderBy: { created_at: 'desc' } });
   res.json({ success: true, data: releases });
+});
+
+/**
+ * POST /api/admin/releases/upload   (multipart/form-data, field "file")
+ * Uploads the installer to the VPS and returns a backend-hosted download URL.
+ * The admin then submits POST /releases with this download_url + file_size.
+ */
+router.post('/releases/upload', releaseUpload.single('file'), (req: Request, res: Response) => {
+  const file = (req as any).file as Express.Multer.File | undefined;
+  if (!file) {
+    res.status(400).json({ success: false, error: 'No installer uploaded. Allowed: .exe, .msi, .zip, .dmg, .AppImage' });
+    return;
+  }
+  // Build an absolute URL the POS can fetch directly. Prefer an explicit
+  // PUBLIC_BACKEND_URL (set behind nginx/HTTPS); else derive from the request.
+  const base = (process.env.PUBLIC_BACKEND_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+  const download_url = `${base}/api/updates/download/${encodeURIComponent(file.filename)}`;
+  res.json({
+    success: true,
+    data: {
+      download_url,
+      file_size: file.size,
+      filename: file.filename,
+      original_name: file.originalname,
+    },
+  });
 });
 
 /**

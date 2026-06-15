@@ -210,7 +210,7 @@ router.post('/complete-db-upload', requireInstance, async (req: Request, res: Re
  */
 router.post('/heartbeat', requireInstance, async (req: Request, res: Response) => {
   const inst = req.instance!;
-  const { store_name, total_sales, total_revenue, total_customers, total_products, app_version } = req.body as Record<string, any>;
+  const { store_name, total_sales, total_revenue, total_customers, total_products, operating_mode, app_version } = req.body as Record<string, any>;
 
   await prisma.instance.update({
     where: { instance_id: inst.instance_id },
@@ -221,6 +221,7 @@ router.post('/heartbeat', requireInstance, async (req: Request, res: Response) =
       total_revenue:   total_revenue != null ? Number(total_revenue) : undefined,
       total_customers: total_customers != null ? Number(total_customers) : undefined,
       total_products:  total_products  != null ? Number(total_products)  : undefined,
+      operating_mode:  operating_mode === 'sales' ? 'sales' : operating_mode === 'full' ? 'full' : undefined,
       app_version:     app_version   || undefined,
     },
   });

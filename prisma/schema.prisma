@@ -33,6 +33,7 @@ model Instance {
   device_fingerprint String    @default("")
   license_revoked    Int       @default(0)  // 0 | 1 — POS expects an integer
   branch_name        String    @default("Main Branch")
+  operating_mode     String    @default("full")  // full | sales — business operating mode reported by the POS
   mobile_access      Boolean   @default(false)   // admin toggles this to allow mobile app login
   cloud_blocked      Boolean   @default(false)   // soft-block: sync disabled, POS still runs locally
   db_upload_status   String    @default("none")  // none | requested | approved | rejected
