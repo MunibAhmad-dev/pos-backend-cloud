@@ -690,7 +690,26 @@ router.get('/analytics', requireInstance, async (req: Request, res: Response) =>
   }
   const salesByDay = Object.entries(salesByDayMap).map(([day, v]) => ({ day, ...v }));
 
-  // Top products from sync_events
+  // Product price/name lookup (sale_item lines often carry no line total, so
+  // revenue must be derived from quantity × the product's price).
+  const productInfoEvents = await prisma.syncEvent.findMany({
+    where: { instance_id: instanceId, entity_type: 'product', operation: { not: 'delete' } },
+    select: { payload: true },
+  });
+  const priceById: Record<string, number> = {};
+  const costById: Record<string, number> = {};
+  const nameById: Record<string, string> = {};
+  for (const e of productInfoEvents) {
+    try {
+      const p = JSON.parse(e.payload) as any;
+      const id = String(p.id);
+      priceById[id] = Number(p.price ?? p.sale_price ?? 0);
+      costById[id]  = Number(p.purchase_price ?? p.cost_price ?? p.cost ?? 0);
+      nameById[id]  = p.name ?? p.product_name ?? id;
+    } catch { continue; }
+  }
+
+  // Top products from sale_item events
   const productEvents = await prisma.syncEvent.findMany({
     where: { instance_id: instanceId, entity_type: 'sale_item' },
     select: { payload: true },
@@ -700,11 +719,21 @@ router.get('/analytics', requireInstance, async (req: Request, res: Response) =>
   for (const e of productEvents) {
     try {
       const p = JSON.parse(e.payload) as any;
-      const key = String(p.product_id || p.name || '');
+      const pid = String(p.product_id ?? '');
+      const key = pid || String(p.product_name || p.name || '');
       if (!key) continue;
-      if (!productMap[key]) productMap[key] = { name: p.product_name || p.name || key, quantity: 0, revenue: 0 };
-      productMap[key].quantity += Number(p.quantity || 0);
-      productMap[key].revenue  += Number(p.total || p.subtotal || 0);
+      const qty = Number(p.quantity ?? p.qty ?? 0);
+      // Prefer an explicit line total; fall back to unit price × qty.
+      let lineRev = Number(p.total ?? p.subtotal ?? p.line_total ?? p.total_price ?? p.amount ?? 0);
+      if (!lineRev) {
+        const unit = Number(p.price ?? p.unit_price ?? p.sale_price ?? priceById[pid] ?? 0);
+        lineRev = unit * qty;
+      }
+      if (!productMap[key]) {
+        productMap[key] = { name: p.product_name || p.name || nameById[pid] || key, quantity: 0, revenue: 0 };
+      }
+      productMap[key].quantity += qty;
+      productMap[key].revenue  += lineRev;
     } catch { continue; }
   }
   const topProducts = Object.entries(productMap)
@@ -712,14 +741,23 @@ router.get('/analytics', requireInstance, async (req: Request, res: Response) =>
     .sort((a, b) => b.revenue - a.revenue)
     .slice(0, 10);
 
-  // Expenses from sync_events
+  // Expenses from sync_events (total + per-day for the P&L graph)
   const expenseEvents = await prisma.syncEvent.findMany({
     where: { instance_id: instanceId, entity_type: 'expense', operation: { not: 'delete' } },
     select: { payload: true },
   });
-  const totalExpenses = expenseEvents.reduce((sum, e) => {
-    try { return sum + Number((JSON.parse(e.payload) as any).amount || 0); } catch { return sum; }
-  }, 0);
+  let totalExpenses = 0;
+  const expenseByDayMap: Record<string, number> = {};
+  for (const e of expenseEvents) {
+    try {
+      const x = JSON.parse(e.payload) as any;
+      const amt = Number(x.amount || 0);
+      totalExpenses += amt;
+      const day = String(x.date_added ?? x.date ?? x.created_at ?? '').slice(0, 10);
+      if (day) expenseByDayMap[day] = (expenseByDayMap[day] || 0) + amt;
+    } catch { continue; }
+  }
+  const expensesByDay = Object.entries(expenseByDayMap).map(([day, amount]) => ({ day, amount }));
 
   const totalRevenue = sales.reduce((sum, s) => sum + Number(s.total || 0), 0);
 
@@ -727,6 +765,7 @@ router.get('/analytics', requireInstance, async (req: Request, res: Response) =>
     success: true,
     data: {
       salesByDay,
+      expensesByDay,
       topProducts,
       totals: {
         revenue:  totalRevenue,
