@@ -12,7 +12,6 @@ import adminRoutes     from './routes/admin';
 import businessRoutes  from './routes/businesses';
 import updateRoutes    from './routes/updates';
 import branchRoutes    from './routes/branches';
-import deviceRoutes    from './routes/devices';
 
 // Prisma client is lazily initialized on first use — no explicit bootstrap needed.
 
@@ -85,7 +84,6 @@ app.use('/api/sync',       syncLimiter,  syncRoutes);
 app.use('/api/admin',                   adminRoutes);
 app.use('/api/updates',                 updateRoutes);   // public — no auth
 app.use('/api/branches',                branchRoutes);
-app.use('/api/devices',    syncLimiter,  deviceRoutes);  // multi-device shop accounts
 app.use('/api',                         businessRoutes);
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {

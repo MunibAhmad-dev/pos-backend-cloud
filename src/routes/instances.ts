@@ -777,4 +777,30 @@ router.get('/analytics', requireInstance, async (req: Request, res: Response) =>
   });
 });
 
+/**
+ * GET /api/instances/cloud-sales
+ *
+ * Returns recent InstanceSale records for the authenticated instance.
+ * Used by the manager computer (Full Management mode) to see sales that were
+ * synced from other POS computers sharing the same cloud credentials.
+ *
+ * Query: ?since=<ISO> (default: last 24 h)
+ */
+router.get('/cloud-sales', requireInstance as any, async (req: Request, res: Response) => {
+  const instance = (req as any).instance;
+  const sinceParam = req.query.since as string | undefined;
+  const since = sinceParam ? new Date(sinceParam) : new Date(Date.now() - 24 * 3600_000);
+
+  const sales = await prisma.instanceSale.findMany({
+    where: {
+      instance_id: instance.instance_id,
+      synced_at:   { gt: since },
+    },
+    orderBy: { synced_at: 'desc' },
+    take: 100,
+  });
+
+  res.json({ success: true, data: sales });
+});
+
 export default router;
