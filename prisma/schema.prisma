@@ -169,6 +169,55 @@ model NotificationRead {
   @@id([notification_id, instance_id])
 }
 
+// ── Multi-Device Shop Accounts ────────────────────────────────────────────────
+// One ShopAccount = one physical shop location.
+// Multiple devices (POS computers, tablets, phones) can enroll under a single
+// ShopAccount using the username + password the admin generates here.
+// This enables cross-device sales visibility and heartbeat-based active tracking.
+model ShopAccount {
+  id            Int          @id @default(autoincrement())
+  shop_code     String       @unique  // e.g. SHOP-ABCD1234 — shown in admin + POS
+  username      String       @unique  // login credential given to shop owner
+  password_hash String                // bcrypt hash — never sent to client
+  shop_name     String       @default("")
+  owner_name    String       @default("")
+  owner_mobile  String       @default("")
+  max_devices   Int          @default(5)
+  is_active     Boolean      @default(true)
+  notes         String       @default("")
+  created_at    DateTime     @default(now())
+  updated_at    DateTime     @updatedAt
+
+  devices       ShopDevice[]
+
+  @@map("shop_accounts")
+  @@index([is_active])
+  @@index([username])
+}
+
+// One row per enrolled device (desktop, tablet, mobile).
+model ShopDevice {
+  id              Int          @id @default(autoincrement())
+  shop_account_id Int
+  device_id       String       @unique  // UUID from the POS (= instance_id or mobile UUID)
+  instance_id     String       @default("")  // links to Instance for shop-feed queries
+  device_name     String       @default("Device")
+  device_type     String       @default("desktop")  // desktop | tablet | mobile
+  device_role     String       @default("sales")    // sales | manager | cashier
+  api_key         String       @unique              // this device's auth token
+  last_heartbeat  DateTime?
+  app_version     String       @default("")
+  is_active       Boolean      @default(true)
+  registered_at   DateTime     @default(now())
+
+  shop_account    ShopAccount  @relation(fields: [shop_account_id], references: [id])
+
+  @@map("shop_devices")
+  @@index([shop_account_id])
+  @@index([api_key])
+  @@index([instance_id])
+}
+
 model BranchRequest {
   id          Int      @id @default(autoincrement())
   instance_id String
