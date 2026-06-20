@@ -1547,9 +1547,10 @@ router.post('/notifications', async (req: Request, res: Response) => {
     title, body, instance_id,
     duration_hours,  // null = permanent
     display_type = 'marquee',  // 'marquee' | 'banner' | 'popup'
+    style = 'violet',          // visual style preset key
   } = req.body as {
     title: string; body: string; instance_id?: string;
-    duration_hours?: number | null; display_type?: string;
+    duration_hours?: number | null; display_type?: string; style?: string;
   };
 
   if (!title?.trim() || !body?.trim()) {
@@ -1571,6 +1572,7 @@ router.post('/notifications', async (req: Request, res: Response) => {
       body:  body.trim(),
       target_instance_id: instance_id || null,
       display_type: display_type || 'marquee',
+      style: style || 'violet',
       expires_at,
     },
   });
@@ -1583,6 +1585,7 @@ router.post('/notifications', async (req: Request, res: Response) => {
       body:               note.body,
       target_instance_id: note.target_instance_id,
       display_type:       note.display_type,
+      style:              note.style,
       expires_at:         note.expires_at,
     },
   });

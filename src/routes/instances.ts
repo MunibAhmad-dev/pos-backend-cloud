@@ -266,7 +266,7 @@ router.get('/notifications', requireInstance, async (req: Request, res: Response
     },
     orderBy: { sent_at: 'desc' },
     take:    20,
-    select:  { id: true, title: true, body: true, sent_at: true, display_type: true, expires_at: true },
+    select:  { id: true, title: true, body: true, sent_at: true, display_type: true, style: true, expires_at: true },
   });
 
   // Mark all as read
@@ -287,7 +287,7 @@ router.get('/notifications', requireInstance, async (req: Request, res: Response
     },
     orderBy: { sent_at: 'desc' },
     take: 5,
-    select: { id: true, title: true, body: true, sent_at: true, display_type: true, expires_at: true },
+    select: { id: true, title: true, body: true, sent_at: true, display_type: true, style: true, expires_at: true },
   });
 
   res.json({ success: true, data: notifications, marquees });
