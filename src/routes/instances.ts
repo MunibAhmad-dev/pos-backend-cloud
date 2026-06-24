@@ -803,4 +803,52 @@ router.get('/cloud-sales', requireInstance as any, async (req: Request, res: Res
   res.json({ success: true, data: sales });
 });
 
+/**
+ * GET /api/instances/pull-data
+ *
+ * Returns deduplicated records from sync_events for this instance.
+ * The POS uses INSERT OR IGNORE when merging so existing local rows
+ * are never overwritten — only missing records are added.
+ *
+ * Query: ?since=<ISO>  (default: epoch — pull everything ever synced)
+ */
+router.get('/pull-data', requireInstance as any, async (req: Request, res: Response) => {
+  const instance = (req as any).instance;
+  const sinceParam = req.query.since as string | undefined;
+  const since = sinceParam ? new Date(sinceParam) : new Date(0);
+
+  const events = await prisma.syncEvent.findMany({
+    where: {
+      instance_id: instance.instance_id,
+      received_at: { gte: since },
+      operation:   { not: 'delete' },
+    },
+    orderBy: { id: 'asc' },
+  });
+
+  // Deduplicate: for each entity_type + id, the highest-id event (latest) wins
+  const entityMap: Record<string, Map<string, any>> = {};
+  for (const ev of events) {
+    if (!entityMap[ev.entity_type]) entityMap[ev.entity_type] = new Map();
+    let payload: any;
+    try { payload = JSON.parse(ev.payload as string); } catch { continue; }
+    if (!payload) continue;
+    const key = String(payload?.id ?? ev.id);
+    entityMap[ev.entity_type].set(key, payload);
+  }
+
+  const result: Record<string, any[]> = {};
+  for (const [type, map] of Object.entries(entityMap)) {
+    result[type] = Array.from(map.values());
+  }
+
+  const total = Object.values(result).reduce((s, arr) => s + arr.length, 0);
+  res.json({
+    success:       true,
+    data:          result,
+    pulled_at:     new Date().toISOString(),
+    total_records: total,
+  });
+});
+
 export default router;

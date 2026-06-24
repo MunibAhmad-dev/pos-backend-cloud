@@ -96,9 +96,25 @@ app.use((_req, res) => {
 });
 
 // ─── Error handler ────────────────────────────────────────────────────────────
-app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+// Must re-apply CORS headers here: if multer or a route middleware throws before
+// res.end(), the headers set by app.use(cors()) may not have been flushed yet,
+// so the browser sees no Access-Control-Allow-Origin and mis-reports it as CORS.
+app.use((err: Error, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  const origin = req.headers.origin as string | undefined;
+  if (origin) {
+    const allowed =
+      _rawOrigins.includes('*') ||
+      _rawOrigins.includes(origin) ||
+      origin.endsWith('.vercel.app');
+    if (allowed) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+      res.setHeader('Vary', 'Origin');
+    }
+  }
+  const status = (err as any).status || (err as any).statusCode || 500;
   console.error('[ERROR]', err.message);
-  res.status(500).json({ success: false, error: err.message || 'Internal server error' });
+  res.status(status).json({ success: false, error: err.message || 'Internal server error' });
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
