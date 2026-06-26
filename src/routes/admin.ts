@@ -121,32 +121,32 @@ function getFirstNumber(source: Record<string, any>, keys: string[]): number {
   return 0;
 }
 
+// Weight-based products (unit_type='gram'/'kg') store stock in their native unit.
+// purchase_price and price_per_kg are always per-kg in the POS.
+// Normalize so calculations are always in kg-equivalent units.
+function normalizeProductStock(product: Record<string, any>): { stock: number; cost: number; salePrice: number } {
+  const rawStock = Math.max(0, getFirstNumber(product, ['stock', 'quantity', 'qty', 'current_stock', 'stock_quantity', 'available_stock']));
+  const cost     = getFirstNumber(product, ['purchase_price', 'cost_price', 'buying_price', 'wholesale_price', 'unit_cost', 'cost']);
+  const unitType = String(product.unit_type || '').toLowerCase();
+  const isGram   = unitType === 'gram';
+  const isWeight = isGram || unitType === 'kg';
+  // gram products: stock is in grams, convert to kg for value calculations
+  const stock    = isGram ? rawStock / 1000 : rawStock;
+  // weight products use price_per_kg as the retail price; regular products use price
+  const pricePerKg = toNumber(product.price_per_kg);
+  const salePrice  = isWeight && pricePerKg > 0
+    ? pricePerKg
+    : getFirstNumber(product, ['price', 'sale_price', 'selling_price', 'retail_price']);
+  return { stock, cost, salePrice };
+}
+
 function calculateInventoryStats(products: any[]) {
   return products.reduce(
     (acc, product) => {
-      const stock = Math.max(0, getFirstNumber(product, [
-        'stock',
-        'quantity',
-        'qty',
-        'current_stock',
-        'stock_quantity',
-        'available_stock',
-      ]));
-      const cost = getFirstNumber(product, [
-        'purchase_price',
-        'cost_price',
-        'buying_price',
-        'wholesale_price',
-        'unit_cost',
-        'cost',
-      ]);
-      const salePrice = getFirstNumber(product, ['price', 'sale_price', 'selling_price', 'retail_price']);
-      const valueAtCost = stock * cost;
-      const valueAtSale = stock * salePrice;
-
-      acc.totalStock += stock;
-      acc.stockValue += valueAtCost;
-      acc.retailValue += valueAtSale;
+      const { stock, cost, salePrice } = normalizeProductStock(product);
+      acc.totalStock  += stock;
+      acc.stockValue  += stock * cost;
+      acc.retailValue += stock * salePrice;
       if (stock <= 0) acc.outOfStock += 1;
       if (stock > 0 && stock <= 5) acc.lowStock += 1;
       return acc;
@@ -949,12 +949,10 @@ router.get('/instances/:id/products', async (req: Request, res: Response) => {
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
   const products = (await parseEntityFromSync(req.params.id, 'product'))
     .map((product) => {
-      const stock = Math.max(0, getFirstNumber(product, ['stock', 'quantity', 'qty', 'current_stock', 'stock_quantity', 'available_stock']));
-      const cost = getFirstNumber(product, ['purchase_price', 'cost_price', 'buying_price', 'wholesale_price', 'unit_cost', 'cost']);
-      const salePrice = getFirstNumber(product, ['price', 'sale_price', 'selling_price', 'retail_price']);
+      const { stock, cost, salePrice } = normalizeProductStock(product);
       return {
         ...product,
-        stock_value: Math.round(stock * cost * 100) / 100,
+        stock_value:        Math.round(stock * cost      * 100) / 100,
         retail_stock_value: Math.round(stock * salePrice * 100) / 100,
       };
     })
