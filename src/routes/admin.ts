@@ -473,7 +473,7 @@ router.get('/instances/:id', async (req: Request, res: Response) => {
   const instance = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
   if (!instance) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
 
-  const [recentEvents, salesStats, products] = await Promise.all([
+  const [recentEvents, salesStats, products, storageSizeRows] = await Promise.all([
     prisma.syncEvent.findMany({
       where:   { instance_id: req.params.id },
       orderBy: { id: 'desc' },
@@ -487,9 +487,13 @@ router.get('/instances/:id', async (req: Request, res: Response) => {
       _max:    { date_created: true },
     }),
     parseEntityFromSync(req.params.id, 'product'),
+    prisma.$queryRaw<Array<{ total_bytes: bigint }>>(
+      Prisma.sql`SELECT COALESCE(SUM(octet_length(payload)), 0) AS total_bytes FROM sync_events WHERE instance_id = ${req.params.id}`
+    ),
   ]);
 
   const inventoryStats = calculateInventoryStats(products);
+  const storageMb = Number(storageSizeRows[0]?.total_bytes ?? 0) / (1024 * 1024);
 
   // Strip password_hash; keep password_plain for admin support viewing
   const { password_hash, password_plain, ...instanceSafe } = instance as any;
@@ -504,6 +508,7 @@ router.get('/instances/:id', async (req: Request, res: Response) => {
       },
       recentEvents,
       inventoryStats,
+      storage_mb: Math.round(storageMb * 100) / 100,
       salesStats: {
         total_synced_sales: salesStats._count.id,
         synced_revenue:     salesStats._sum.total,
