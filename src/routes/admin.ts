@@ -277,6 +277,12 @@ router.post('/manufacturing/instances/:id/block', async (req: Request, res: Resp
   res.json({ success: true });
 });
 
+router.post('/manufacturing/instances/:id/unblock', async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  await prisma.manufacturingInstance.update({ where: { id }, data: { approval_status: 'approved' } });
+  res.json({ success: true });
+});
+
 // ── Stats ─────────────────────────────────────────────────────────────────────
 router.get('/stats', async (_req: Request, res: Response) => {
   const now     = new Date();
