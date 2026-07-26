@@ -12,6 +12,7 @@ import adminRoutes     from './routes/admin';
 import businessRoutes  from './routes/businesses';
 import updateRoutes    from './routes/updates';
 import branchRoutes    from './routes/branches';
+import manufacturingRoutes from './routes/manufacturing'; // Factory ERP (Air Cooler Manufacturing) app — shares this backend with the POS
 
 // Prisma client is lazily initialized on first use — no explicit bootstrap needed.
 
@@ -85,6 +86,8 @@ app.use('/api/admin',                   adminRoutes);
 app.use('/api/updates',                 updateRoutes);   // public — no auth
 app.use('/api/branches',                branchRoutes);
 app.use('/api',                         businessRoutes);
+// APIs for the Manufacturing app (Factory ERP) — see routes/manufacturing/
+app.use('/api/manufacturing',           manufacturingRoutes);
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'pos-backend-cloud', timestamp: new Date().toISOString() });

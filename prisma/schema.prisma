@@ -170,6 +170,36 @@ model NotificationRead {
 }
 
 
+// Factory ERP (Air Cooler Manufacturing) — device/license registration.
+// Deliberately a separate model from Instance (POS) so this app's data never
+// mixes with or migrates against POS tables. mobile is the user-facing ID,
+// matching how the POS uses owner_mobile to identify a device.
+model ManufacturingInstance {
+  id                 Int       @id @default(autoincrement())
+  mobile             String    @unique
+  password_hash      String
+  company_name       String    @default("")
+  api_key            String    @unique
+  device_fingerprint String    @default("")
+  license_plan       String    @default("none") // none | monthly | lifetime — no trial tier
+  license_expiry     String?   // ISO string, null for trial/lifetime
+  trial_start        DateTime  @default(now())
+  approval_status    String    @default("pending") // pending | approved | blocked
+  app_version        String    @default("")
+  last_seen          DateTime?
+  // Latest business snapshot, pushed by the Electron app — lets a future website
+  // show read-only stats without needing the full local schema replicated in the cloud.
+  total_sales        Int       @default(0)
+  total_revenue      Float     @default(0)
+  total_products     Int       @default(0)
+  total_parts        Int       @default(0)
+  low_stock_items    Int       @default(0)
+  created_at         DateTime  @default(now())
+  updated_at         DateTime  @updatedAt
+
+  @@map("manufacturing_instances")
+}
+
 model BranchRequest {
   id          Int      @id @default(autoincrement())
   instance_id String

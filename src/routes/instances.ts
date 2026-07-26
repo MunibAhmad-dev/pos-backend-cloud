@@ -458,14 +458,25 @@ router.get('/parent', requireInstance, async (req: Request, res: Response) => {
 router.get('/cloud-counts', requireInstance, async (req: Request, res: Response) => {
   const instanceId = req.instance!.instance_id;
 
-  // Count distinct entity IDs per type (payload->>'id' as the dedup key)
+  // Count live entities per type: latest event per (entity_type, id) must not be a delete.
   const rows = await prisma.$queryRaw<Array<{ entity_type: string; distinct_count: bigint }>>(
     Prisma.sql`
+      WITH latest AS (
+        SELECT entity_type,
+               (payload::jsonb)->>'id' AS entity_id,
+               operation,
+               ROW_NUMBER() OVER (
+                 PARTITION BY entity_type, (payload::jsonb)->>'id'
+                 ORDER BY id DESC
+               ) AS rn
+        FROM   sync_events
+        WHERE  instance_id = ${instanceId}
+      )
       SELECT entity_type,
-             COUNT(DISTINCT (payload::jsonb)->>'id') AS distinct_count
-      FROM   sync_events
-      WHERE  instance_id = ${instanceId}
-        AND  operation   != 'delete'
+             COUNT(DISTINCT entity_id) AS distinct_count
+      FROM   latest
+      WHERE  rn = 1
+        AND  operation != 'delete'
       GROUP  BY entity_type
     `
   );
@@ -821,12 +832,15 @@ router.get('/pull-data', requireInstance as any, async (req: Request, res: Respo
     where: {
       instance_id: instance.instance_id,
       received_at: { gte: since },
-      operation:   { not: 'delete' },
+      // Include delete events so deleted entities are excluded from the result,
+      // not re-inserted on the POS side. (Filtering deletes out here caused
+      // deleted records to reappear after every pull.)
     },
     orderBy: { id: 'asc' },
   });
 
-  // Deduplicate: for each entity_type + id, the highest-id event (latest) wins
+  // Deduplicate: events are ordered oldest→newest so the last event wins.
+  // Delete events remove the entity; subsequent creates can re-add it.
   const entityMap: Record<string, Map<string, any>> = {};
   for (const ev of events) {
     if (!entityMap[ev.entity_type]) entityMap[ev.entity_type] = new Map();
@@ -834,7 +848,11 @@ router.get('/pull-data', requireInstance as any, async (req: Request, res: Respo
     try { payload = JSON.parse(ev.payload as string); } catch { continue; }
     if (!payload) continue;
     const key = String(payload?.id ?? ev.id);
-    entityMap[ev.entity_type].set(key, payload);
+    if (ev.operation === 'delete') {
+      entityMap[ev.entity_type].delete(key);
+    } else {
+      entityMap[ev.entity_type].set(key, payload);
+    }
   }
 
   const result: Record<string, any[]> = {};

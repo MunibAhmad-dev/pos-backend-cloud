@@ -237,6 +237,46 @@ async function buildExportPayload(instanceId: string) {
 const router = Router();
 router.use(requireAdmin);
 
+// ── Manufacturing (Factory ERP) instances — separate table from POS Instance ──
+// List, most-recently-active first, pending ones easy to spot via approval_status.
+router.get('/manufacturing/instances', async (_req: Request, res: Response) => {
+  const instances = await prisma.manufacturingInstance.findMany({ orderBy: { created_at: 'desc' } });
+  res.json({ success: true, instances });
+});
+
+// Approve a pending (or re-approve a blocked) installation and allocate a plan:
+// { plan: 'monthly' | 'lifetime', duration_days?: number }. Mirrors POS's
+// /instances/:id/approve — same shape, just against ManufacturingInstance.
+router.post('/manufacturing/instances/:id/approve', async (req: Request, res: Response) => {
+  const { plan, duration_days } = req.body as { plan?: string; duration_days?: number };
+  const id = Number(req.params.id);
+  const existing = await prisma.manufacturingInstance.findUnique({ where: { id } });
+  if (!existing) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  let license_plan = existing.license_plan;
+  let license_expiry: string | null = existing.license_expiry;
+  if (plan === 'lifetime') {
+    license_plan = 'lifetime';
+    license_expiry = null;
+  } else if (plan === 'monthly') {
+    const days = Number(duration_days) || 30;
+    license_plan = 'monthly';
+    license_expiry = new Date(Date.now() + days * 86_400_000).toISOString();
+  }
+
+  const updated = await prisma.manufacturingInstance.update({
+    where: { id },
+    data: { approval_status: 'approved', license_plan, license_expiry },
+  });
+  res.json({ success: true, instance: updated });
+});
+
+router.post('/manufacturing/instances/:id/block', async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  await prisma.manufacturingInstance.update({ where: { id }, data: { approval_status: 'blocked' } });
+  res.json({ success: true });
+});
+
 // ── Stats ─────────────────────────────────────────────────────────────────────
 router.get('/stats', async (_req: Request, res: Response) => {
   const now     = new Date();
