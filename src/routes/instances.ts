@@ -301,22 +301,43 @@ router.get('/notifications', requireInstance, async (req: Request, res: Response
 router.get('/export', requireInstance, async (req: Request, res: Response) => {
   const instanceId = req.instance!.instance_id;
 
-  const rawEvents = await prisma.syncEvent.findMany({
-    where:   { instance_id: instanceId },
-    orderBy: { id: 'asc' },
-  });
-
-  // Deduplicate — latest state wins, deletes remove the entry
+  // A full export genuinely needs every event this instance has ever synced
+  // — unlike pull-data/analytics, there's no smaller "correct" scope to bound
+  // it to. But loading that in one findMany() (previously no `take` at all)
+  // meant Postgres would hand back a single unbounded result set and Node
+  // would hold the whole thing in memory at once — on a long-running store
+  // that's easily hundreds of MB, on a single-process 400MB-capped backend.
+  // Reading it in fixed-size batches keeps peak memory bounded to one batch
+  // regardless of total history size, and yielding to the event loop between
+  // batches lets other shops' requests get served in between rather than
+  // this one call monopolizing the process for its entire duration.
+  const EXPORT_BATCH_SIZE = 5000;
   const entityMap: Record<string, Map<string, any>> = {};
-  for (const event of rawEvents) {
-    const type = event.entity_type;
-    if (!entityMap[type]) entityMap[type] = new Map();
-    let payload: any = null;
-    try { payload = JSON.parse(event.payload); } catch { continue; }
-    if (!payload) continue;
-    const key = String(payload?.id ?? payload?.barcode ?? event.id);
-    if (event.operation === 'delete') entityMap[type].delete(key);
-    else entityMap[type].set(key, payload);
+  let cursorId = 0;
+  let rawEventCount = 0;
+  for (;;) {
+    const batch = await prisma.syncEvent.findMany({
+      where:   { instance_id: instanceId, id: { gt: cursorId } },
+      orderBy: { id: 'asc' },
+      take:    EXPORT_BATCH_SIZE,
+    });
+    if (batch.length === 0) break;
+    rawEventCount += batch.length;
+
+    for (const event of batch) {
+      const type = event.entity_type;
+      if (!entityMap[type]) entityMap[type] = new Map();
+      let payload: any = null;
+      try { payload = JSON.parse(event.payload); } catch { continue; }
+      if (!payload) continue;
+      const key = String(payload?.id ?? payload?.barcode ?? event.id);
+      if (event.operation === 'delete') entityMap[type].delete(key);
+      else entityMap[type].set(key, payload);
+    }
+
+    cursorId = batch[batch.length - 1].id;
+    if (batch.length < EXPORT_BATCH_SIZE) break;
+    await new Promise(r => setImmediate(r)); // yield — let other requests interleave
   }
 
   const structured: Record<string, any[]> = {};
@@ -360,6 +381,7 @@ router.get('/export', requireInstance, async (req: Request, res: Response) => {
     customers:              structured.customer         || [],
     vendors:                structured.vendor           || [],
     employees:              structured.employee         || [],
+    employee_advances:      structured.employee_advance || [],
     // ── Sales ───────────────────────────────────────────────────────────────
     sales:                  structured.sale?.length     ? structured.sale : fallbackSales,
     sale_items:             structured.sale_item        || [],
@@ -383,7 +405,7 @@ router.get('/export', requireInstance, async (req: Request, res: Response) => {
     // ── History ─────────────────────────────────────────────────────────────
     entity_history:         structured.entity_history || [],
     // ── Meta ────────────────────────────────────────────────────────────────
-    raw_events_count:       rawEvents.length,
+    raw_events_count:       rawEventCount,
   });
 });
 
@@ -621,26 +643,34 @@ router.get('/dashboard', requireInstance, async (req: Request, res: Response) =>
   const instanceId = req.instance!.instance_id;
   const inst = req.instance!;
 
-  // Sales from instance_sales table (fast)
-  const allSales = await prisma.instanceSale.findMany({
-    where: { instance_id: instanceId },
-    select: { total: true, date_created: true },
-  });
-
+  // Aggregated in Postgres, not loaded into Node memory — the old version
+  // pulled the instance's ENTIRE sales history into a JS array just to sum
+  // it, which on a large/long-running store could be a multi-hundred-MB
+  // load on a single-process, memory-capped backend shared by every shop.
   const now = new Date();
   const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
 
-  const todayRevenue = allSales
-    .filter(s => s.date_created && new Date(s.date_created) >= todayStart)
-    .reduce((sum, s) => sum + Number(s.total || 0), 0);
+  const [todayAgg, monthAgg, totalAgg] = await Promise.all([
+    prisma.instanceSale.aggregate({
+      where: { instance_id: instanceId, date_created: { gte: todayStart.toISOString() } },
+      _sum: { total: true },
+    }),
+    prisma.instanceSale.aggregate({
+      where: { instance_id: instanceId, date_created: { gte: monthStart.toISOString() } },
+      _sum: { total: true },
+    }),
+    prisma.instanceSale.aggregate({
+      where: { instance_id: instanceId },
+      _sum: { total: true },
+      _count: { _all: true },
+    }),
+  ]);
 
-  const monthRevenue = allSales
-    .filter(s => s.date_created && new Date(s.date_created) >= monthStart)
-    .reduce((sum, s) => sum + Number(s.total || 0), 0);
-
-  const totalRevenue = allSales.reduce((sum, s) => sum + Number(s.total || 0), 0);
-  const totalSales = allSales.length;
+  const todayRevenue = Number(todayAgg._sum.total || 0);
+  const monthRevenue = Number(monthAgg._sum.total || 0);
+  const totalRevenue = Number(totalAgg._sum.total || 0);
+  const totalSales   = totalAgg._count._all;
 
   // Counts from sync_events
   const counts = await prisma.syncEvent.groupBy({
@@ -680,6 +710,13 @@ router.get('/analytics', requireInstance, async (req: Request, res: Response) =>
 
   const from = date_from ? new Date(date_from) : new Date(Date.now() - 30 * 86400000);
   const to   = date_to   ? new Date(date_to)   : new Date();
+  // Hard safety caps on every query below — the previous version had NO limit
+  // on any of these (two of the four had no date filter at all, regardless of
+  // the date_from/date_to the caller passed in), so a store with enough
+  // history could load its entire lifetime of events into this one request.
+  // On a single-process, 400MB-capped backend shared by every shop, that's
+  // enough to OOM the whole service, not just slow down this one call.
+  const ANALYTICS_ROW_CAP = 20_000;
 
   // Sales by day — date_created is string|null so filter nulls and use string comparison
   const sales = await prisma.instanceSale.findMany({
@@ -689,6 +726,7 @@ router.get('/analytics', requireInstance, async (req: Request, res: Response) =>
     },
     select: { total: true, date_created: true },
     orderBy: { date_created: 'asc' },
+    take: ANALYTICS_ROW_CAP,
   });
 
   const salesByDayMap: Record<string, { revenue: number; count: number }> = {};
@@ -702,10 +740,12 @@ router.get('/analytics', requireInstance, async (req: Request, res: Response) =>
   const salesByDay = Object.entries(salesByDayMap).map(([day, v]) => ({ day, ...v }));
 
   // Product price/name lookup (sale_item lines often carry no line total, so
-  // revenue must be derived from quantity × the product's price).
+  // revenue must be derived from quantity × the product's price). Reference
+  // data, not time-series, so no date bound applies — just a hard row cap.
   const productInfoEvents = await prisma.syncEvent.findMany({
     where: { instance_id: instanceId, entity_type: 'product', operation: { not: 'delete' } },
     select: { payload: true },
+    take: ANALYTICS_ROW_CAP,
   });
   const priceById: Record<string, number> = {};
   const costById: Record<string, number> = {};
@@ -720,10 +760,17 @@ router.get('/analytics', requireInstance, async (req: Request, res: Response) =>
     } catch { continue; }
   }
 
-  // Top products from sale_item events
+  // Top products from sale_item events — previously had NO date filter at
+  // all (unlike the sales query above), so it loaded every sale_item ever
+  // synced regardless of the requested range. Bounded by received_at now,
+  // same range as the sales query.
   const productEvents = await prisma.syncEvent.findMany({
-    where: { instance_id: instanceId, entity_type: 'sale_item' },
+    where: {
+      instance_id: instanceId, entity_type: 'sale_item',
+      received_at: { gte: from, lte: to },
+    },
     select: { payload: true },
+    take: ANALYTICS_ROW_CAP,
   });
 
   const productMap: Record<string, { name: string; quantity: number; revenue: number }> = {};
@@ -752,10 +799,15 @@ router.get('/analytics', requireInstance, async (req: Request, res: Response) =>
     .sort((a, b) => b.revenue - a.revenue)
     .slice(0, 10);
 
-  // Expenses from sync_events (total + per-day for the P&L graph)
+  // Expenses from sync_events (total + per-day for the P&L graph) — same
+  // missing-date-filter issue as sale_item above, fixed the same way.
   const expenseEvents = await prisma.syncEvent.findMany({
-    where: { instance_id: instanceId, entity_type: 'expense', operation: { not: 'delete' } },
+    where: {
+      instance_id: instanceId, entity_type: 'expense', operation: { not: 'delete' },
+      received_at: { gte: from, lte: to },
+    },
     select: { payload: true },
+    take: ANALYTICS_ROW_CAP,
   });
   let totalExpenses = 0;
   const expenseByDayMap: Record<string, number> = {};
@@ -823,35 +875,70 @@ router.get('/cloud-sales', requireInstance as any, async (req: Request, res: Res
  *
  * Query: ?since=<ISO>  (default: epoch — pull everything ever synced)
  */
+// Hard cap per pull — without this, an instance whose local `since` cursor
+// was ever lost (e.g. app restart before the fix below, since it used to
+// live only in renderer memory) would request its ENTIRE history in one
+// query. On a single-process, 400MB-capped backend, one such request could
+// OOM the process and take the whole service down for every other shop.
+// The client now loops on `hasMore` to catch up across several small calls
+// instead of one unbounded one.
+const PULL_DATA_LIMIT = 3000;
+
 router.get('/pull-data', requireInstance as any, async (req: Request, res: Response) => {
   const instance = (req as any).instance;
-  const sinceParam = req.query.since as string | undefined;
-  const since = sinceParam ? new Date(sinceParam) : new Date(0);
+  // sinceId (event id cursor) is preferred — unambiguous, no tie-breaking
+  // issues from multiple events sharing a millisecond timestamp. `since`
+  // (date-based) is kept as a fallback for any client not yet updated.
+  const sinceIdParam = req.query.sinceId as string | undefined;
+  const sinceParam   = req.query.since   as string | undefined;
 
+  const where: any = { instance_id: instance.instance_id };
+  if (sinceIdParam) {
+    where.id = { gt: Number(sinceIdParam) || 0 };
+  } else {
+    const since = sinceParam ? new Date(sinceParam) : new Date(0);
+    where.received_at = { gte: since };
+  }
+
+  // Fetch one extra row to detect whether more pages remain, without a
+  // separate COUNT query.
   const events = await prisma.syncEvent.findMany({
-    where: {
-      instance_id: instance.instance_id,
-      received_at: { gte: since },
-      // Include delete events so deleted entities are excluded from the result,
-      // not re-inserted on the POS side. (Filtering deletes out here caused
-      // deleted records to reappear after every pull.)
-    },
+    where,
     orderBy: { id: 'asc' },
+    take: PULL_DATA_LIMIT + 1,
   });
 
+  const hasMore = events.length > PULL_DATA_LIMIT;
+  const page = hasMore ? events.slice(0, PULL_DATA_LIMIT) : events;
+  const lastId = page.length ? page[page.length - 1].id : (Number(sinceIdParam) || 0);
+
   // Deduplicate: events are ordered oldest→newest so the last event wins.
-  // Delete events remove the entity; subsequent creates can re-add it.
+  // Delete events remove the entity from the reconstructed state AND get
+  // recorded in `deletedMap` — previously deletes were silently absorbed
+  // here with no trace, so the response was purely additive. The POS client
+  // only ever INSERT OR IGNOREs from `data`, so it had no way to learn "this
+  // record used to exist and should now be removed locally" — a delete
+  // never actually propagated to sibling devices sharing the same instance.
+  // Worse, since those devices' local copy never got removed, their own
+  // periodic full-resync would re-push it as a "new" create, resurrecting
+  // it everywhere on the next pull. `deleted` below closes that hole.
   const entityMap: Record<string, Map<string, any>> = {};
-  for (const ev of events) {
+  const deletedMap: Record<string, Set<string>> = {};
+  for (const ev of page) {
     if (!entityMap[ev.entity_type]) entityMap[ev.entity_type] = new Map();
+    if (!deletedMap[ev.entity_type]) deletedMap[ev.entity_type] = new Set();
     let payload: any;
     try { payload = JSON.parse(ev.payload as string); } catch { continue; }
     if (!payload) continue;
     const key = String(payload?.id ?? ev.id);
     if (ev.operation === 'delete') {
       entityMap[ev.entity_type].delete(key);
+      deletedMap[ev.entity_type].add(key);
     } else {
       entityMap[ev.entity_type].set(key, payload);
+      // A later create/update for the same key within this page un-deletes it
+      // (create → delete → re-create all inside one batch is rare but possible).
+      deletedMap[ev.entity_type].delete(key);
     }
   }
 
@@ -859,13 +946,20 @@ router.get('/pull-data', requireInstance as any, async (req: Request, res: Respo
   for (const [type, map] of Object.entries(entityMap)) {
     result[type] = Array.from(map.values());
   }
+  const deleted: Record<string, string[]> = {};
+  for (const [type, set] of Object.entries(deletedMap)) {
+    if (set.size) deleted[type] = Array.from(set);
+  }
 
   const total = Object.values(result).reduce((s, arr) => s + arr.length, 0);
   res.json({
     success:       true,
     data:          result,
+    deleted,
     pulled_at:     new Date().toISOString(),
     total_records: total,
+    hasMore,
+    lastId,
   });
 });
 

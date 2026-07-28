@@ -197,7 +197,51 @@ model ManufacturingInstance {
   created_at         DateTime  @default(now())
   updated_at         DateTime  @updatedAt
 
+  sync_events        ManufacturingSyncEvent[]
+  instance_sales     ManufacturingInstanceSale[]
+
   @@map("manufacturing_instances")
+}
+
+// Raw event log for every create/update/delete pushed by a Factory ERP install —
+// mirrors the POS's SyncEvent. Lets the admin dashboard browse actual records
+// (sales, purchases, products, parts, customers, vendors), not just rollup counts.
+model ManufacturingSyncEvent {
+  id          Int      @id @default(autoincrement())
+  instance_id Int
+  entity_type String   // sale | purchase | product | part | customer | vendor
+  operation   String   // create | update | delete
+  local_id    Int?     // the record's id on the client's local SQLite db
+  payload     String   // raw JSON string
+  received_at DateTime @default(now())
+
+  instance    ManufacturingInstance @relation(fields: [instance_id], references: [id])
+
+  @@map("manufacturing_sync_events")
+  @@index([instance_id])
+  @@index([instance_id, entity_type])
+}
+
+// Flattened, idempotent view of sale creates — mirrors the POS's InstanceSale —
+// so headline revenue/order-count queries don't need to scan raw JSON payloads.
+model ManufacturingInstanceSale {
+  id             Int      @id @default(autoincrement())
+  instance_id    Int
+  local_sale_id  Int
+  total          Float    @default(0)
+  paid_amount    Float    @default(0)
+  payment_method String   @default("Cash")
+  status         String   @default("Completed")
+  customer_name  String   @default("")
+  items_count    Int      @default(0)
+  date_created   String?
+  synced_at      DateTime @default(now())
+
+  instance       ManufacturingInstance @relation(fields: [instance_id], references: [id])
+
+  @@map("manufacturing_instance_sales")
+  @@unique([instance_id, local_sale_id])
+  @@index([instance_id])
 }
 
 model BranchRequest {

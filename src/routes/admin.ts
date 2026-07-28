@@ -283,6 +283,43 @@ router.post('/manufacturing/instances/:id/unblock', async (req: Request, res: Re
   res.json({ success: true });
 });
 
+// Raw synced-record browser — every create/update/delete this install has pushed,
+// most recent first. `entity_type` (sale|purchase|product|part|customer|vendor)
+// narrows the feed; `payload` is returned parsed for the frontend table.
+router.get('/manufacturing/instances/:id/events', async (req: Request, res: Response) => {
+  const instance_id = Number(req.params.id);
+  const entity_type = typeof req.query.entity_type === 'string' ? req.query.entity_type : undefined;
+  const limit = Math.min(Number(req.query.limit) || 50, 200);
+  const offset = Number(req.query.offset) || 0;
+
+  const events = await prisma.manufacturingSyncEvent.findMany({
+    where: { instance_id, ...(entity_type ? { entity_type } : {}) },
+    orderBy: { received_at: 'desc' },
+    take: limit,
+    skip: offset,
+  });
+  res.json({
+    success: true,
+    events: events.map(e => ({ ...e, payload: (() => { try { return JSON.parse(e.payload); } catch { return e.payload; } })() })),
+  });
+});
+
+// Flattened sales feed for an instance — backs the Sales tab in the admin's
+// manufacturing instance detail page.
+router.get('/manufacturing/instances/:id/sales', async (req: Request, res: Response) => {
+  const instance_id = Number(req.params.id);
+  const limit = Math.min(Number(req.query.limit) || 50, 200);
+  const offset = Number(req.query.offset) || 0;
+
+  const sales = await prisma.manufacturingInstanceSale.findMany({
+    where: { instance_id },
+    orderBy: { synced_at: 'desc' },
+    take: limit,
+    skip: offset,
+  });
+  res.json({ success: true, sales });
+});
+
 // ── Stats ─────────────────────────────────────────────────────────────────────
 router.get('/stats', async (_req: Request, res: Response) => {
   const now     = new Date();

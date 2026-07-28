@@ -4,6 +4,23 @@ import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 
+// ─── Crash safety ─────────────────────────────────────────────────────────────
+// This process serves every connected shop — there's no isolation between
+// requests. Without these handlers, an unhandled promise rejection anywhere
+// (an async route not wrapped in try/catch, a background timer, etc.) could
+// silently kill the whole server with no record of why, taking every shop
+// offline until PM2's autorestart kicks in. Log first so it's diagnosable,
+// then exit only for genuinely corrupted process state (uncaughtException) —
+// a rejected promise alone isn't reason enough to drop every other in-flight
+// request.
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught exception — process will restart:', err);
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL] Unhandled promise rejection (process kept alive):', reason);
+});
+
 // Route modules
 import authRoutes      from './routes/auth';
 import instanceRoutes  from './routes/instances';
