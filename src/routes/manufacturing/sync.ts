@@ -164,4 +164,45 @@ router.post('/sync', requireManufacturingInstance, async (req: Request, res: Res
   res.json({ success: true });
 });
 
+/**
+ * GET /api/manufacturing/cloud-counts — [auth: Bearer api_key]
+ *
+ * Returns the count of DISTINCT records currently live in the cloud for each
+ * entity type (sale/purchase/product/part/customer/vendor) — latest event per
+ * local_id wins, and anything whose latest event is a delete is excluded.
+ * Powers the "Local vs Cloud" comparison table in the Electron app's Settings page.
+ */
+router.get('/cloud-counts', requireManufacturingInstance, async (req: Request, res: Response) => {
+  const inst = req.mfgInstance!;
+
+  const rows = await prisma.$queryRaw<Array<{ entity_type: string; distinct_count: bigint }>>(
+    Prisma.sql`
+      WITH latest AS (
+        SELECT entity_type,
+               local_id,
+               operation,
+               ROW_NUMBER() OVER (
+                 PARTITION BY entity_type, local_id
+                 ORDER BY id DESC
+               ) AS rn
+        FROM   manufacturing_sync_events
+        WHERE  instance_id = ${inst.id}
+      )
+      SELECT entity_type,
+             COUNT(DISTINCT local_id) AS distinct_count
+      FROM   latest
+      WHERE  rn = 1
+        AND  operation != 'delete'
+      GROUP  BY entity_type
+    `
+  );
+
+  const counts: Record<string, number> = {};
+  for (const row of rows) {
+    counts[row.entity_type] = Number(row.distinct_count ?? 0);
+  }
+
+  res.json({ success: true, data: counts });
+});
+
 export default router;
