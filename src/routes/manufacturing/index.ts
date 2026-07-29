@@ -7,6 +7,12 @@ import dashboardRoutes from './dashboard';
 import invoicesRoutes from './invoices';
 import reportsRoutes from './reports';
 import sellRoutes from './sell';
+import partsRoutes from './parts';
+import productsRoutes from './products';
+import vendorsRoutes from './vendors';
+import customersRoutes from './customers';
+import accountingRoutes from './accounting';
+import expensesRoutes from './expenses';
 
 // All Factory ERP (Air Cooler Manufacturing) app routes live under this folder,
 // kept separate from the POS's routes/models entirely. Mounted at /api/manufacturing
@@ -21,6 +27,12 @@ router.use('/', dashboardRoutes);    // /dashboard
 router.use('/', invoicesRoutes);     // /invoices
 router.use('/', reportsRoutes);      // /reports
 router.use('/', sellRoutes);         // /sell-items
+router.use('/', partsRoutes);        // /parts CRUD
+router.use('/', productsRoutes);     // /products CRUD
+router.use('/', vendorsRoutes);      // /vendors CRUD + /vendors/:id/profile
+router.use('/', customersRoutes);    // /customers CRUD + /customers/:id/profile
+router.use('/', accountingRoutes);   // /accounts CRUD + /accounting/ledger + /accounts/transfer
+router.use('/', expensesRoutes);     // /expenses CRUD
 
 router.get('/health', (_req: Request, res: Response) => {
   res.json({ success: true, service: 'manufacturing', timestamp: new Date().toISOString() });
