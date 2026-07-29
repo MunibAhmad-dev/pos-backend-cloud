@@ -48,8 +48,10 @@ router.get('/sell-items', requireManufacturingInstance, async (req: Request, res
       name:                p.name    || '',
       category:            p.category || '',
       stock:               Number(p.stock            ?? 0),
-      price:               Number(p.price            ?? 0),
-      purchase_price:      Number(p.purchase_price   ?? 0),
+      // Electron desktop may store selling price as selling_price or price
+      price:               Number(p.price ?? p.selling_price ?? 0),
+      // Electron desktop may store purchase/cost as purchase_price or cost_price
+      purchase_price:      Number(p.purchase_price ?? p.cost_price ?? 0),
       low_stock_threshold: Number(p.low_stock_threshold ?? LOW),
       unit:                p.unit || 'pc',
     }));
@@ -58,8 +60,11 @@ router.get('/sell-items', requireManufacturingInstance, async (req: Request, res
       id:                  p.id,
       name:                p.name    || '',
       category:            p.category || '',
-      stock:               Number(p.stock      ?? 0),
-      cost_price:          Number(p.cost_price ?? p.price ?? 0),
+      stock:               Number(p.stock ?? 0),
+      // Purchase/cost price — try all known field names the desktop may use
+      cost_price:          Number(p.cost_price ?? p.purchase_price ?? p.price ?? 0),
+      // Selling price — try all known field names
+      selling_price:       Number(p.selling_price ?? p.sale_price ?? p.price ?? p.cost_price ?? 0),
       low_stock_threshold: Number(p.low_stock_threshold ?? LOW),
       unit:                p.unit || 'pc',
     }));

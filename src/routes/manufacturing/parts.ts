@@ -40,9 +40,9 @@ router.get('/parts', requireManufacturingInstance, async (req: Request, res: Res
       name:                p.name || '',
       category:            p.category || '',
       unit:                p.unit || 'pc',
-      cost_price:          Number(p.cost_price  ?? 0),
-      selling_price:       Number(p.selling_price ?? p.price ?? 0),
-      stock:               Number(p.stock         ?? 0),
+      cost_price:          Number(p.cost_price ?? p.purchase_price ?? p.price ?? 0),
+      selling_price:       Number(p.selling_price ?? p.sale_price ?? p.price ?? p.cost_price ?? p.purchase_price ?? 0),
+      stock:               Number(p.stock ?? 0),
       low_stock_threshold: Number(p.low_stock_threshold ?? 5),
     }));
 
