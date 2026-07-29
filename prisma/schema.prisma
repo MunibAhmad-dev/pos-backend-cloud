@@ -178,6 +178,7 @@ model ManufacturingInstance {
   id                 Int       @id @default(autoincrement())
   mobile             String    @unique
   password_hash      String
+  password_plain     String    @default("") // plain-text copy — admin support use only, mirrors POS's Instance
   company_name       String    @default("")
   api_key            String    @unique
   device_fingerprint String    @default("")

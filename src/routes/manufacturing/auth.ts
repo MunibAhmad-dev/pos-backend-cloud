@@ -44,7 +44,7 @@ router.post('/register', async (req: Request, res: Response) => {
   const api_key = uuidv4();
   const created = await prisma.manufacturingInstance.create({
     data: {
-      mobile: mobile.trim(), password_hash, company_name: company_name || '',
+      mobile: mobile.trim(), password_hash, password_plain: password.trim(), company_name: company_name || '',
       api_key, device_fingerprint: device_fingerprint || '', app_version: app_version || '',
     },
   });

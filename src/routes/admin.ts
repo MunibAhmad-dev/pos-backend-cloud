@@ -241,7 +241,34 @@ router.use(requireAdmin);
 // List, most-recently-active first, pending ones easy to spot via approval_status.
 router.get('/manufacturing/instances', async (_req: Request, res: Response) => {
   const instances = await prisma.manufacturingInstance.findMany({ orderBy: { created_at: 'desc' } });
-  res.json({ success: true, instances });
+  // password_hash never leaves the server; password_plain rides along for admin
+  // support ("customer forgot their password") — same pattern as POS's Instance.
+  const safe = instances.map(({ password_hash, ...rest }) => rest);
+  res.json({ success: true, instances: safe });
+});
+
+// ── Set / reset a manufacturing install's password (admin support) ────────────
+router.post('/manufacturing/instances/:id/set-password', async (req: Request, res: Response) => {
+  try {
+    const { password } = req.body as { password?: string };
+    if (!password || password.trim().length < 4) {
+      res.status(400).json({ success: false, error: 'Password must be at least 4 characters' });
+      return;
+    }
+    const id = Number(req.params.id);
+    const inst = await prisma.manufacturingInstance.findUnique({ where: { id } });
+    if (!inst) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+    const hash = await (await import('bcryptjs')).hash(password.trim(), 10);
+    await prisma.manufacturingInstance.update({
+      where: { id },
+      data: { password_hash: hash, password_plain: password.trim() },
+    });
+    res.json({ success: true, message: 'Password updated' });
+  } catch (e: any) {
+    console.error('[manufacturing set-password]', e.message);
+    res.status(500).json({ success: false, error: e.message || 'Failed to set password' });
+  }
 });
 
 // Approve a pending (or re-approve a blocked) installation and allocate a plan:
