@@ -56,7 +56,7 @@ router.post('/expenses', requireManufacturingInstance, async (req: Request, res:
   if (!title?.trim()) { res.status(400).json({ success: false, error: 'Title is required' }); return; }
   if (!amount || Number(amount) <= 0) { res.status(400).json({ success: false, error: 'Amount must be positive' }); return; }
   try {
-    const id  = Date.now();
+    const id  = Math.floor(Date.now() / 1000);
     const now = new Date().toISOString();
     const expensePayload = {
       id, title: title.trim(),

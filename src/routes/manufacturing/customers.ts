@@ -120,7 +120,7 @@ router.post('/customers', requireManufacturingInstance, async (req: Request, res
   const { name, phone, whatsapp, address, city, notes } = req.body;
   if (!name?.trim()) { res.status(400).json({ success: false, error: 'Customer name is required' }); return; }
   try {
-    const id = Date.now();
+    const id = Math.floor(Date.now() / 1000);
     const payload = {
       id, name: name.trim(),
       phone:    (phone    || '').trim(),

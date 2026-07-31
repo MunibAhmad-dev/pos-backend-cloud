@@ -130,7 +130,7 @@ router.post('/accounts', requireManufacturingInstance, async (req: Request, res:
   const { name, type, opening_balance, bank_name, account_number, notes } = req.body;
   if (!name?.trim()) { res.status(400).json({ success: false, error: 'Account name is required' }); return; }
   try {
-    const id = Date.now();
+    const id = Math.floor(Date.now() / 1000);
     const ob = Number(opening_balance || 0);
     const payload = {
       id, name: name.trim(),
@@ -208,7 +208,7 @@ router.post('/accounts/transfer', requireManufacturingInstance, async (req: Requ
   }
   try {
     const now   = new Date().toISOString();
-    const outId = Date.now();
+    const outId = Math.floor(Date.now() / 1000);
     const inId  = outId + 1;
     await prisma.$transaction([
       prisma.manufacturingSyncEvent.create({ data: { instance_id: inst.id, entity_type: 'account_txn', operation: 'create', local_id: outId, payload: JSON.stringify({ id: outId, account_id: Number(from_account_id), type: 'out', amount: Number(amount), category: 'transfer', note: note || '', date_created: now }) } }),

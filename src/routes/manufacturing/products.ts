@@ -132,7 +132,7 @@ router.post('/products', requireManufacturingInstance, async (req: Request, res:
   }
 
   try {
-    const id = Date.now();
+    const id = Math.floor(Date.now() / 1000);
     const payload = {
       id,
       name:              name.trim(),

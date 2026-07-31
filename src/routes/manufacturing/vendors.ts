@@ -123,7 +123,7 @@ router.post('/vendors', requireManufacturingInstance, async (req: Request, res: 
   const { name, company_name, phone, whatsapp, address, email, ntn, notes } = req.body;
   if (!name?.trim()) { res.status(400).json({ success: false, error: 'Vendor name is required' }); return; }
   try {
-    const id = Date.now();
+    const id = Math.floor(Date.now() / 1000);
     const payload = {
       id, name: name.trim(),
       company_name: (company_name || '').trim(),
