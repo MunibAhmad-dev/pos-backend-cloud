@@ -651,17 +651,28 @@ router.get('/dashboard', requireInstance, async (req: Request, res: Response) =>
   const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
 
+  // date_created is a STRING column holding two formats: ISO ("2026-08-01T14:00:00.000Z",
+  // web clients) and SQLite localtime ("2026-08-01 19:00:00", desktop). Comparing
+  // against a full ISO timestamp breaks lexicographically for desktop rows
+  // (' ' < 'T'), silently excluding every desktop sale from today/month revenue.
+  // A date-only floor ("2026-08-01") compares correctly against BOTH formats.
+  const dayFloor = (d: Date) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+  // Cancelled sales must never count toward revenue.
+  const notCancelled = { not: 'Cancelled' };
+
   const [todayAgg, monthAgg, totalAgg] = await Promise.all([
     prisma.instanceSale.aggregate({
-      where: { instance_id: instanceId, date_created: { gte: todayStart.toISOString() } },
+      where: { instance_id: instanceId, status: notCancelled, date_created: { gte: dayFloor(todayStart) } },
       _sum: { total: true },
     }),
     prisma.instanceSale.aggregate({
-      where: { instance_id: instanceId, date_created: { gte: monthStart.toISOString() } },
+      where: { instance_id: instanceId, status: notCancelled, date_created: { gte: dayFloor(monthStart) } },
       _sum: { total: true },
     }),
     prisma.instanceSale.aggregate({
-      where: { instance_id: instanceId },
+      where: { instance_id: instanceId, status: notCancelled },
       _sum: { total: true },
       _count: { _all: true },
     }),
@@ -718,15 +729,30 @@ router.get('/analytics', requireInstance, async (req: Request, res: Response) =>
   // enough to OOM the whole service, not just slow down this one call.
   const ANALYTICS_ROW_CAP = 20_000;
 
-  // Sales by day — date_created is string|null so filter nulls and use string comparison
-  const sales = await prisma.instanceSale.findMany({
+  // Sales by day — date_created is a string column holding BOTH ISO (web) and
+  // SQLite localtime (desktop) formats, so full-timestamp string comparison is
+  // broken at the boundaries (' ' < 'T'). Query with widened date-only floors
+  // (which compare correctly against both formats), then filter precisely in
+  // JS with real Date parsing. Cancelled sales are excluded — they are not
+  // revenue.
+  const dayFloorStr = (d: Date) =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const dayAfterTo = new Date(to.getTime() + 86400000);
+  const salesRaw = await prisma.instanceSale.findMany({
     where: {
       instance_id: instanceId,
-      date_created: { gte: from.toISOString(), lte: to.toISOString() },
+      status: { not: 'Cancelled' },
+      date_created: { gte: dayFloorStr(new Date(from.getTime() - 86400000)), lt: dayFloorStr(dayAfterTo) },
     },
     select: { total: true, date_created: true },
     orderBy: { date_created: 'asc' },
     take: ANALYTICS_ROW_CAP,
+  });
+  const parseDate = (s: string) => new Date(s.includes('T') ? s : s.replace(' ', 'T'));
+  const sales = salesRaw.filter((s) => {
+    if (!s.date_created) return false;
+    const d = parseDate(s.date_created);
+    return !isNaN(d.getTime()) && d >= from && d <= to;
   });
 
   const salesByDayMap: Record<string, { revenue: number; count: number }> = {};
