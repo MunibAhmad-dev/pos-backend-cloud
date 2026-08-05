@@ -78,6 +78,22 @@ router.post('/register-business', async (req: Request, res: Response) => {
       } else if (existing.password_hash && !password) {
         res.status(401).json({ success: false, error: 'Password required for this account' });
         return;
+      } else if (!existing.password_hash) {
+        // Passwordless legacy account — previously ANY caller with the mobile
+        // number was handed the api_key (and silently became the password
+        // owner), which let one shop pull another shop's entire data. Only the
+        // original device (fingerprint match) may re-register silently; any
+        // other device is refused until a password is set by the admin.
+        const sameDevice =
+          !!fingerprint && !!existing.device_fingerprint &&
+          fingerprint.trim() === existing.device_fingerprint;
+        if (!sameDevice) {
+          res.status(401).json({
+            success: false,
+            error: 'This account has no password set. Contact OsaTech support to set a password before signing in from a new device.',
+          });
+          return;
+        }
       }
 
       const updateData: Record<string, any> = {};

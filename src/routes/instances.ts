@@ -402,6 +402,8 @@ router.get('/export', requireInstance, async (req: Request, res: Response) => {
     account_txns:           structured.account_txn      || [],
     registers:              structured.register         || [],
     financial_transactions: structured.financial_transaction || [],
+    // ── Warranty ────────────────────────────────────────────────────────────
+    warranty_claims:        structured.warranty_claim || [],
     // ── History ─────────────────────────────────────────────────────────────
     entity_history:         structured.entity_history || [],
     // ── Meta ────────────────────────────────────────────────────────────────
