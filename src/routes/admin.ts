@@ -1,4 +1,4 @@
-import { Router, Request, Response } from 'express';
+import express, { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 import path from 'path';
@@ -583,7 +583,7 @@ router.get('/instances/:id', async (req: Request, res: Response) => {
   const instance = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
   if (!instance) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
 
-  const [recentEvents, salesStats, products, storageSizeRows] = await Promise.all([
+  const [recentEvents, salesStats, products, storageSizeRows, saleItemEvents] = await Promise.all([
     prisma.syncEvent.findMany({
       where:   { instance_id: req.params.id },
       orderBy: { id: 'desc' },
@@ -595,15 +595,49 @@ router.get('/instances/:id', async (req: Request, res: Response) => {
       _count:  { id: true },
       _sum:    { total: true },
       _max:    { date_created: true },
+      _min:    { date_created: true },
     }),
     parseEntityFromSync(req.params.id, 'product'),
     prisma.$queryRaw<Array<{ total_bytes: bigint }>>(
       Prisma.sql`SELECT COALESCE(SUM(octet_length(payload)), 0) AS total_bytes FROM sync_events WHERE instance_id = ${req.params.id}`
     ),
+    // Scan sale_item create events to compute COGS → gross profit
+    prisma.syncEvent.findMany({
+      where:  { instance_id: req.params.id, entity_type: 'sale_item', operation: 'create' },
+      select: { payload: true },
+    }),
   ]);
 
   const inventoryStats = calculateInventoryStats(products);
   const storageMb = Number(storageSizeRows[0]?.total_bytes ?? 0) / (1024 * 1024);
+
+  // Gross profit: sum(qty × cost_per_item) across all sale_item create events
+  const productCostMap = new Map<string, number>();
+  for (const p of products) {
+    const pid = String(p.id ?? p.barcode ?? '');
+    if (pid) productCostMap.set(pid, getFirstNumber(p, ['purchase_price','cost_price','buying_price','wholesale_price','unit_cost','cost']));
+  }
+  let totalCOGS = 0;
+  let itemsWithCost = 0;
+  for (const ev of saleItemEvents) {
+    try {
+      const item = JSON.parse(ev.payload);
+      const qty  = Math.max(0, getFirstNumber(item, ['qty','quantity','item_qty']));
+      const cost = getFirstNumber(item, ['purchase_price','cost_price','buying_price','unit_cost','cost'])
+                || productCostMap.get(String(item.product_id ?? item.productId ?? ''))
+                || 0;
+      if (cost > 0) { totalCOGS += qty * cost; itemsWithCost++; }
+    } catch { /* skip malformed payload */ }
+  }
+  const synced_revenue = Number(salesStats._sum.total || 0);
+  const gross_profit   = itemsWithCost > 0 ? Math.round(synced_revenue - totalCOGS) : null;
+
+  // Days active: from first sale date to today (min 1)
+  const firstSale = salesStats._min.date_created;
+  const daysActive = firstSale
+    ? Math.max(1, Math.ceil((Date.now() - new Date(firstSale).getTime()) / 86_400_000))
+    : null;
+  const gross_profit_per_day = (gross_profit != null && daysActive) ? Math.round(gross_profit / daysActive) : null;
 
   // Strip password_hash; keep password_plain for admin support viewing
   const { password_hash, password_plain, ...instanceSafe } = instance as any;
@@ -620,9 +654,14 @@ router.get('/instances/:id', async (req: Request, res: Response) => {
       inventoryStats,
       storage_mb: Math.round(storageMb * 100) / 100,
       salesStats: {
-        total_synced_sales: salesStats._count.id,
-        synced_revenue:     salesStats._sum.total,
-        last_sale_date:     salesStats._max.date_created,
+        total_synced_sales:   salesStats._count.id,
+        synced_revenue,
+        last_sale_date:       salesStats._max.date_created,
+        first_sale_date:      firstSale,
+        gross_profit,
+        gross_profit_per_day,
+        days_active:          daysActive,
+        cogs_coverage_items:  itemsWithCost,  // how many items had cost data
       },
     },
   });
@@ -1313,65 +1352,6 @@ router.get('/analytics', async (req: Request, res: Response) => {
   const { date_from, date_to } = req.query as Record<string, string>;
   const hasDateRange = !!(date_from && date_to);
 
-  // Revenue by instance (top 10)
-  let revenueByInstance: any[];
-  if (hasDateRange) {
-    revenueByInstance = await prisma.$queryRaw<any[]>(Prisma.sql`
-      SELECT i.instance_id, i.store_name, i.owner_mobile,
-             COALESCE(s.total_revenue, 0) AS total_revenue,
-             COALESCE(s.total_sales, 0)   AS total_sales,
-             i.total_customers, i.total_products
-      FROM instances i
-      LEFT JOIN (
-        SELECT instance_id, SUM(total)::float AS total_revenue, COUNT(*)::int AS total_sales
-        FROM instance_sales
-        WHERE DATE(CAST(date_created AS TIMESTAMP)) BETWEEN ${date_from}::date AND ${date_to}::date
-        GROUP BY instance_id
-      ) s ON s.instance_id = i.instance_id
-      WHERE i.approval_status = 'approved'
-      ORDER BY COALESCE(s.total_revenue, 0) DESC LIMIT 10
-    `);
-  } else {
-    revenueByInstance = await prisma.instance.findMany({
-      where:   { approval_status: 'approved' },
-      orderBy: { total_revenue: 'desc' },
-      take:    10,
-      select:  { instance_id: true, store_name: true, owner_mobile: true, total_revenue: true, total_sales: true, total_customers: true, total_products: true },
-    });
-  }
-
-  // Activity distribution by last_seen recency
-  const activityDistribution = await prisma.$queryRaw<any[]>(Prisma.sql`
-    SELECT
-      CASE
-        WHEN last_seen >= NOW() - INTERVAL '1 day'   THEN 'Today'
-        WHEN last_seen >= NOW() - INTERVAL '7 days'  THEN 'This Week'
-        WHEN last_seen >= NOW() - INTERVAL '30 days' THEN 'This Month'
-        WHEN last_seen IS NOT NULL                   THEN 'Older'
-        ELSE 'Never'
-      END AS period,
-      COUNT(*)::int AS count
-    FROM instances
-    GROUP BY period
-    ORDER BY CASE period WHEN 'Today' THEN 1 WHEN 'This Week' THEN 2 WHEN 'This Month' THEN 3 WHEN 'Older' THEN 4 ELSE 5 END
-  `);
-
-  // Plan distribution
-  const planDistribution = await prisma.$queryRaw<any[]>(Prisma.sql`
-    SELECT COALESCE(NULLIF(license_plan,''),'none') AS plan, COUNT(*)::int AS count
-    FROM instances WHERE approval_status = 'approved'
-    GROUP BY plan ORDER BY count DESC
-  `);
-
-  // Status distribution
-  const statusDistribution = await prisma.$queryRaw<any[]>(Prisma.sql`
-    SELECT approval_status AS status, COUNT(*)::int AS count
-    FROM instances GROUP BY approval_status
-  `);
-
-  // Sales trend by day
-  // Strategy: try the requested date range first. If that returns 0 rows, automatically
-  // expand to show ALL available data so the chart is never blank when data exists.
   const salesDayQ = (whereClause: Prisma.Sql) => prisma.$queryRaw<any[]>(Prisma.sql`
     SELECT TO_CHAR(CAST(date_created AS TIMESTAMP), 'YYYY-MM-DD') AS day,
            COUNT(*)::int                                           AS sales_count,
@@ -1382,151 +1362,168 @@ router.get('/analytics', async (req: Request, res: Response) => {
     GROUP BY day ORDER BY day
   `);
 
-  let salesByDay: any[];
-  if (hasDateRange) {
-    salesByDay = await salesDayQ(
-      Prisma.sql`AND DATE(CAST(date_created AS TIMESTAMP)) BETWEEN ${date_from}::date AND ${date_to}::date`
-    );
-    // If selected range is empty, fall back to last 90 days, then all-time
-    if (salesByDay.length === 0) {
-      salesByDay = await salesDayQ(
-        Prisma.sql`AND CAST(date_created AS TIMESTAMP) >= NOW() - INTERVAL '90 days'`
-      );
-    }
-    if (salesByDay.length === 0) {
-      salesByDay = await salesDayQ(Prisma.sql``);   // all-time fallback
-    }
-  } else {
-    salesByDay = await salesDayQ(
-      Prisma.sql`AND CAST(date_created AS TIMESTAMP) >= NOW() - INTERVAL '30 days'`
-    );
-    if (salesByDay.length === 0) {
-      salesByDay = await salesDayQ(Prisma.sql``);
-    }
-  }
+  // Run all independent queries in parallel — eliminates 12 sequential round-trips
+  const [
+    revenueByInstance,
+    activityDistribution,
+    planDistribution,
+    statusDistribution,
+    salesByDayPrimary,
+    salesByDayFallback,
+    topEntityTypes,
+    recentSummaries,
+    totalsAgg,
+    plRevPrimary,
+    plExpPrimary,
+    plRevFallback,
+    plExpFallback,
+    regTrend,
+    accountTypeDist,
+    accountTxnVolume,
+    accountBalRow,
+    accountTxnRow,
+  ] = await Promise.all([
+    // 1. Revenue by instance (top 10)
+    hasDateRange
+      ? prisma.$queryRaw<any[]>(Prisma.sql`
+          SELECT i.instance_id, i.store_name, i.owner_mobile,
+                 COALESCE(s.total_revenue, 0) AS total_revenue,
+                 COALESCE(s.total_sales, 0)   AS total_sales,
+                 i.total_customers, i.total_products
+          FROM instances i
+          LEFT JOIN (
+            SELECT instance_id, SUM(total)::float AS total_revenue, COUNT(*)::int AS total_sales
+            FROM instance_sales
+            WHERE DATE(CAST(date_created AS TIMESTAMP)) BETWEEN ${date_from}::date AND ${date_to}::date
+            GROUP BY instance_id
+          ) s ON s.instance_id = i.instance_id
+          WHERE i.approval_status = 'approved'
+          ORDER BY COALESCE(s.total_revenue, 0) DESC LIMIT 10
+        `)
+      : prisma.instance.findMany({
+          where:   { approval_status: 'approved' },
+          orderBy: { total_revenue: 'desc' },
+          take:    10,
+          select:  { instance_id: true, store_name: true, owner_mobile: true, total_revenue: true, total_sales: true, total_customers: true, total_products: true },
+        }),
 
-  // Top entity types by event count
-  const topEntityTypes = await prisma.$queryRaw<any[]>(Prisma.sql`
-    SELECT entity_type, COUNT(*)::int AS event_count
-    FROM sync_events GROUP BY entity_type ORDER BY event_count DESC
-  `);
+    // 2. Activity distribution
+    prisma.$queryRaw<any[]>(Prisma.sql`
+      SELECT
+        CASE
+          WHEN last_seen >= NOW() - INTERVAL '1 day'   THEN 'Today'
+          WHEN last_seen >= NOW() - INTERVAL '7 days'  THEN 'This Week'
+          WHEN last_seen >= NOW() - INTERVAL '30 days' THEN 'This Month'
+          WHEN last_seen IS NOT NULL                   THEN 'Older'
+          ELSE 'Never'
+        END AS period,
+        COUNT(*)::int AS count
+      FROM instances
+      GROUP BY period
+      ORDER BY CASE period WHEN 'Today' THEN 1 WHEN 'This Week' THEN 2 WHEN 'This Month' THEN 3 WHEN 'Older' THEN 4 ELSE 5 END
+    `),
 
-  // Top products from items_summary
-  const recentSummaries = await prisma.instanceSale.findMany({
-    where:  { items_summary: { not: '' } },
-    select: { items_summary: true },
-  });
-  const productQtyMap = new Map<string, number>();
-  for (const row of recentSummaries) {
-    if (!row.items_summary) continue;
-    for (const part of row.items_summary.split(',')) {
-      const match = part.trim().match(/^(.+?)\s*\(x(\d+)\)$/);
-      if (match) {
-        const name = match[1].trim();
-        productQtyMap.set(name, (productQtyMap.get(name) ?? 0) + (parseInt(match[2], 10) || 1));
-      }
-    }
-  }
-  const topProducts = Array.from(productQtyMap.entries())
-    .sort((a, b) => b[1] - a[1]).slice(0, 12).map(([name, qty]) => ({ name, qty }));
+    // 3. Plan distribution
+    prisma.$queryRaw<any[]>(Prisma.sql`
+      SELECT COALESCE(NULLIF(license_plan,''),'none') AS plan, COUNT(*)::int AS count
+      FROM instances WHERE approval_status = 'approved'
+      GROUP BY plan ORDER BY count DESC
+    `),
 
-  // Global totals
-  const totalsAgg = await prisma.instance.aggregate({
-    where:  { approval_status: 'approved' },
-    _sum:   { total_customers: true, total_products: true, total_sales: true, total_revenue: true },
-  });
+    // 4. Status distribution
+    prisma.$queryRaw<any[]>(Prisma.sql`
+      SELECT approval_status AS status, COUNT(*)::int AS count
+      FROM instances GROUP BY approval_status
+    `),
 
-  const vendorTotalRow = await prisma.$queryRaw<[{ cnt: bigint }]>(Prisma.sql`
-    SELECT COUNT(DISTINCT (payload::jsonb)->>'id' || instance_id)::int AS cnt
-    FROM sync_events WHERE entity_type = 'vendor' AND operation = 'create'
-  `);
+    // 5a. Sales by day — primary window
+    hasDateRange
+      ? salesDayQ(Prisma.sql`AND DATE(CAST(date_created AS TIMESTAMP)) BETWEEN ${date_from}::date AND ${date_to}::date`)
+      : salesDayQ(Prisma.sql`AND CAST(date_created AS TIMESTAMP) >= NOW() - INTERVAL '30 days'`),
 
-  // Profit & Loss by month — all-time fallback when date range has no data
-  let plRevRows: any[], plExpRows: any[];
-  const plRevAllTime = () => prisma.$queryRaw<any[]>(Prisma.sql`
-    SELECT TO_CHAR(CAST(date_created AS TIMESTAMP), 'YYYY-MM') AS month,
-           COALESCE(SUM(total), 0)::float AS revenue
-    FROM instance_sales WHERE date_created IS NOT NULL
-    GROUP BY month ORDER BY month
-  `);
-  const plExpAllTime = () => prisma.$queryRaw<any[]>(Prisma.sql`
-    SELECT TO_CHAR(received_at, 'YYYY-MM') AS month,
-           COALESCE(SUM(CAST((payload::jsonb)->>'amount' AS FLOAT)), 0) AS expenses
-    FROM sync_events WHERE entity_type = 'expense' AND operation != 'delete'
-    GROUP BY month ORDER BY month
-  `);
+    // 5b. Sales by day — all-time fallback (runs in parallel, used only if primary is empty)
+    salesDayQ(Prisma.sql``),
 
-  if (hasDateRange) {
-    [plRevRows, plExpRows] = await Promise.all([
-      prisma.$queryRaw<any[]>(Prisma.sql`
-        SELECT TO_CHAR(CAST(date_created AS TIMESTAMP), 'YYYY-MM') AS month,
-               COALESCE(SUM(total), 0)::float AS revenue
-        FROM instance_sales
-        WHERE date_created IS NOT NULL
-          AND DATE(CAST(date_created AS TIMESTAMP)) BETWEEN ${date_from}::date AND ${date_to}::date
-        GROUP BY month ORDER BY month
-      `),
-      prisma.$queryRaw<any[]>(Prisma.sql`
-        SELECT TO_CHAR(received_at, 'YYYY-MM') AS month,
-               COALESCE(SUM(CAST((payload::jsonb)->>'amount' AS FLOAT)), 0) AS expenses
-        FROM sync_events
-        WHERE entity_type = 'expense' AND operation != 'delete'
-          AND DATE(received_at) BETWEEN ${date_from}::date AND ${date_to}::date
-        GROUP BY month ORDER BY month
-      `),
-    ]);
-    // Fallback to all-time if range returns nothing
-    if (plRevRows.length === 0 && plExpRows.length === 0) {
-      [plRevRows, plExpRows] = await Promise.all([plRevAllTime(), plExpAllTime()]);
-    }
-  } else {
-    [plRevRows, plExpRows] = await Promise.all([
-      prisma.$queryRaw<any[]>(Prisma.sql`
-        SELECT TO_CHAR(CAST(date_created AS TIMESTAMP), 'YYYY-MM') AS month,
-               COALESCE(SUM(total), 0)::float AS revenue
-        FROM instance_sales
-        WHERE date_created IS NOT NULL
-          AND CAST(date_created AS TIMESTAMP) >= NOW() - INTERVAL '12 months'
-        GROUP BY month ORDER BY month
-      `),
-      prisma.$queryRaw<any[]>(Prisma.sql`
-        SELECT TO_CHAR(received_at, 'YYYY-MM') AS month,
-               COALESCE(SUM(CAST((payload::jsonb)->>'amount' AS FLOAT)), 0) AS expenses
-        FROM sync_events WHERE entity_type = 'expense' AND operation != 'delete'
-          AND received_at >= NOW() - INTERVAL '12 months'
-        GROUP BY month ORDER BY month
-      `),
-    ]);
-    if (plRevRows.length === 0 && plExpRows.length === 0) {
-      [plRevRows, plExpRows] = await Promise.all([plRevAllTime(), plExpAllTime()]);
-    }
-  }
+    // 6. Top entity types
+    prisma.$queryRaw<any[]>(Prisma.sql`
+      SELECT entity_type, COUNT(*)::int AS event_count
+      FROM sync_events GROUP BY entity_type ORDER BY event_count DESC
+    `),
 
-  const plMerge = new Map<string, { revenue: number; expenses: number }>();
-  for (const r of plRevRows)  plMerge.set(r.month, { revenue: Number(r.revenue), expenses: 0 });
-  for (const e of plExpRows) {
-    const ex = plMerge.get(e.month) ?? { revenue: 0, expenses: 0 };
-    plMerge.set(e.month, { ...ex, expenses: Number(e.expenses) });
-  }
-  const profitLossData = Array.from(plMerge.entries()).sort(([a], [b]) => a.localeCompare(b))
-    .map(([month, d]) => ({ month, revenue: Math.round(d.revenue), expenses: Math.round(d.expenses), profit: Math.round(d.revenue - d.expenses) }));
+    // 7. Top products — LIMIT 500 recent rows instead of all rows
+    prisma.instanceSale.findMany({
+      where:   { items_summary: { not: '' } },
+      select:  { items_summary: true },
+      orderBy: { id: 'desc' },
+      take:    500,
+    }),
 
-  // Registration trend — ALL TIME grouped by month so the chart is never blank.
-  // Includes a running cumulative total so the dashboard can show growth over time.
-  const regTrend = await prisma.$queryRaw<any[]>(Prisma.sql`
-    SELECT TO_CHAR(created_at, 'YYYY-MM') AS month,
-           COUNT(*)::int                  AS count
-    FROM instances
-    GROUP BY month ORDER BY month
-  `);
-  let cumulative = 0;
-  const registrationsTrend = regTrend.map(r => {
-    cumulative += Number(r.count);
-    return { month: r.month, newStores: Number(r.count), total: cumulative };
-  });
+    // 8. Global totals
+    prisma.instance.aggregate({
+      where: { approval_status: 'approved' },
+      _sum:  { total_customers: true, total_products: true, total_sales: true, total_revenue: true },
+    }),
 
-  // Account stats from sync_events
-  const [accountTypeDist, accountTxnVolume, accountBalRow, accountTxnRow] = await Promise.all([
+    // 9a. P&L revenue — primary window
+    hasDateRange
+      ? prisma.$queryRaw<any[]>(Prisma.sql`
+          SELECT TO_CHAR(CAST(date_created AS TIMESTAMP), 'YYYY-MM') AS month,
+                 COALESCE(SUM(total), 0)::float AS revenue
+          FROM instance_sales
+          WHERE date_created IS NOT NULL
+            AND DATE(CAST(date_created AS TIMESTAMP)) BETWEEN ${date_from}::date AND ${date_to}::date
+          GROUP BY month ORDER BY month
+        `)
+      : prisma.$queryRaw<any[]>(Prisma.sql`
+          SELECT TO_CHAR(CAST(date_created AS TIMESTAMP), 'YYYY-MM') AS month,
+                 COALESCE(SUM(total), 0)::float AS revenue
+          FROM instance_sales
+          WHERE date_created IS NOT NULL
+            AND CAST(date_created AS TIMESTAMP) >= NOW() - INTERVAL '12 months'
+          GROUP BY month ORDER BY month
+        `),
+
+    // 9b. P&L expenses — primary window
+    hasDateRange
+      ? prisma.$queryRaw<any[]>(Prisma.sql`
+          SELECT TO_CHAR(received_at, 'YYYY-MM') AS month,
+                 COALESCE(SUM(CAST((payload::jsonb)->>'amount' AS FLOAT)), 0) AS expenses
+          FROM sync_events
+          WHERE entity_type = 'expense' AND operation != 'delete'
+            AND DATE(received_at) BETWEEN ${date_from}::date AND ${date_to}::date
+          GROUP BY month ORDER BY month
+        `)
+      : prisma.$queryRaw<any[]>(Prisma.sql`
+          SELECT TO_CHAR(received_at, 'YYYY-MM') AS month,
+                 COALESCE(SUM(CAST((payload::jsonb)->>'amount' AS FLOAT)), 0) AS expenses
+          FROM sync_events WHERE entity_type = 'expense' AND operation != 'delete'
+            AND received_at >= NOW() - INTERVAL '12 months'
+          GROUP BY month ORDER BY month
+        `),
+
+    // 9c. P&L revenue fallback — all-time (runs in parallel, used only if primary is empty)
+    prisma.$queryRaw<any[]>(Prisma.sql`
+      SELECT TO_CHAR(CAST(date_created AS TIMESTAMP), 'YYYY-MM') AS month,
+             COALESCE(SUM(total), 0)::float AS revenue
+      FROM instance_sales WHERE date_created IS NOT NULL
+      GROUP BY month ORDER BY month
+    `),
+
+    // 9d. P&L expenses fallback — all-time
+    prisma.$queryRaw<any[]>(Prisma.sql`
+      SELECT TO_CHAR(received_at, 'YYYY-MM') AS month,
+             COALESCE(SUM(CAST((payload::jsonb)->>'amount' AS FLOAT)), 0) AS expenses
+      FROM sync_events WHERE entity_type = 'expense' AND operation != 'delete'
+      GROUP BY month ORDER BY month
+    `),
+
+    // 10. Registration trend
+    prisma.$queryRaw<any[]>(Prisma.sql`
+      SELECT TO_CHAR(created_at, 'YYYY-MM') AS month, COUNT(*)::int AS count
+      FROM instances GROUP BY month ORDER BY month
+    `),
+
+    // 11–14. Account stats (4 queries already in parallel via outer Promise.all)
     prisma.$queryRaw<any[]>(Prisma.sql`
       SELECT COALESCE(NULLIF((payload::jsonb)->>'type',''), 'other') AS account_type,
              COUNT(*)::int AS count,
@@ -1550,6 +1547,45 @@ router.get('/analytics', async (req: Request, res: Response) => {
     `),
   ]);
 
+  // Pick best salesByDay result
+  const salesByDay: any[] = salesByDayPrimary.length > 0 ? salesByDayPrimary : salesByDayFallback;
+
+  // Pick best P&L result
+  const plRevRows: any[] = plRevPrimary.length > 0 ? plRevPrimary : plRevFallback;
+  const plExpRows: any[] = plExpPrimary.length > 0 ? plExpPrimary : plExpFallback;
+
+  // Build P&L merge
+  const plMerge = new Map<string, { revenue: number; expenses: number }>();
+  for (const r of plRevRows) plMerge.set(r.month, { revenue: Number(r.revenue), expenses: 0 });
+  for (const e of plExpRows) {
+    const ex = plMerge.get(e.month) ?? { revenue: 0, expenses: 0 };
+    plMerge.set(e.month, { ...ex, expenses: Number(e.expenses) });
+  }
+  const profitLossData = Array.from(plMerge.entries()).sort(([a], [b]) => a.localeCompare(b))
+    .map(([month, d]) => ({ month, revenue: Math.round(d.revenue), expenses: Math.round(d.expenses), profit: Math.round(d.revenue - d.expenses) }));
+
+  // Build registrationsTrend with cumulative total
+  let cumulative = 0;
+  const registrationsTrend = regTrend.map((r: any) => {
+    cumulative += Number(r.count);
+    return { month: r.month, newStores: Number(r.count), total: cumulative };
+  });
+
+  // Parse top products from limited recent summaries
+  const productQtyMap = new Map<string, number>();
+  for (const row of recentSummaries) {
+    if (!row.items_summary) continue;
+    for (const part of row.items_summary.split(',')) {
+      const match = part.trim().match(/^(.+?)\s*\(x(\d+)\)$/);
+      if (match) {
+        const name = match[1].trim();
+        productQtyMap.set(name, (productQtyMap.get(name) ?? 0) + (parseInt(match[2], 10) || 1));
+      }
+    }
+  }
+  const topProducts = Array.from(productQtyMap.entries())
+    .sort((a, b) => b[1] - a[1]).slice(0, 12).map(([name, qty]) => ({ name, qty }));
+
   res.json({
     success: true,
     data: {
@@ -1560,7 +1596,6 @@ router.get('/analytics', async (req: Request, res: Response) => {
         total_products:  Number(totalsAgg._sum.total_products  || 0),
         total_sales:     Number(totalsAgg._sum.total_sales     || 0),
         total_revenue:   Number(totalsAgg._sum.total_revenue   || 0),
-        total_vendors:   Number(vendorTotalRow[0]?.cnt          || 0),
       },
       profitLossData,
       registrationsTrend,
@@ -2065,6 +2100,329 @@ router.patch('/branch-requests/:id/reject', async (req: Request, res: Response) 
   }
 });
 
+
+// ─── Data Management ──────────────────────────────────────────────────────────
+
+// Categorised sets for the purge UI
+const PURGEABLE_GROUPS: Record<string, { label: string; types: string[] }> = {
+  sales:    { label: 'Sales & Returns',    types: ['sale', 'sale_item', 'sale_return', 'sale_return_item'] },
+  expenses: { label: 'Expenses',           types: ['expense'] },
+  purchases:{ label: 'Purchases',          types: ['purchase', 'inventory_batch', 'purchase_return', 'purchase_return_item'] },
+  payments: { label: 'Payments & Ledger',  types: ['customer_payment', 'vendor_payment', 'account_txn', 'financial_transaction', 'register'] },
+};
+const ALL_PURGEABLE_TYPES = Object.values(PURGEABLE_GROUPS).flatMap(g => g.types);
+
+/**
+ * POST /api/admin/instances/:id/data/purge
+ * Body: { groups: string[], beforeDate: string, preview?: boolean }
+ *
+ * preview=true  → dry-run: returns count + breakdown by entity_type, nothing deleted.
+ * preview=false → deletes and returns the deleted events (up to UNDO_LIMIT) for
+ *                 client-side undo. If count > UNDO_LIMIT, undo_available=false.
+ */
+const UNDO_LIMIT = 5_000; // max events returned for undo storage
+
+router.post('/instances/:id/data/purge', async (req: Request, res: Response) => {
+  try {
+    const { groups, beforeDate, preview = false } = req.body as { groups?: string[]; beforeDate?: string; preview?: boolean };
+    if (!Array.isArray(groups) || groups.length === 0) {
+      res.status(400).json({ success: false, error: 'groups[] required' }); return;
+    }
+    if (!beforeDate) {
+      res.status(400).json({ success: false, error: 'beforeDate required' }); return;
+    }
+    const cutoff = new Date(beforeDate);
+    if (isNaN(cutoff.getTime())) {
+      res.status(400).json({ success: false, error: 'Invalid date' }); return;
+    }
+
+    const instance = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
+    if (!instance) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+    const entityTypes = groups.flatMap(g => PURGEABLE_GROUPS[g]?.types ?? []).filter(t => ALL_PURGEABLE_TYPES.includes(t));
+    if (entityTypes.length === 0) {
+      res.status(400).json({ success: false, error: 'No valid entity types in groups' }); return;
+    }
+
+    const where = { instance_id: req.params.id, entity_type: { in: entityTypes }, received_at: { lt: cutoff } };
+
+    if (preview) {
+      // Dry-run: group counts by entity_type
+      const counts = await prisma.syncEvent.groupBy({
+        by: ['entity_type'],
+        where,
+        _count: { _all: true },
+        orderBy: { _count: { entity_type: 'desc' } },
+      });
+      const total = counts.reduce((s, r) => s + r._count._all, 0);
+      res.json({ success: true, preview: true, total, breakdown: counts.map(r => ({ entity_type: r.entity_type, count: r._count._all })) });
+      return;
+    }
+
+    // Fetch events for undo before deleting
+    const undoEvents = await prisma.syncEvent.findMany({
+      where,
+      orderBy: { id: 'asc' },
+      take: UNDO_LIMIT + 1,
+      select: { entity_type: true, operation: true, payload: true, received_at: true },
+    });
+    const undoAvailable = undoEvents.length <= UNDO_LIMIT;
+    const eventsForUndo = undoAvailable ? undoEvents : [];
+
+    const result = await prisma.syncEvent.deleteMany({ where });
+
+    res.json({
+      success: true,
+      deleted: result.count,
+      entityTypes,
+      undo_available: undoAvailable,
+      // Return events for client-side undo storage (only when count is manageable)
+      undo_events: eventsForUndo.map(e => ({
+        entity_type: e.entity_type,
+        operation: e.operation,
+        payload: e.payload,
+        received_at: e.received_at,
+      })),
+    });
+  } catch (e: any) {
+    console.error('[data/purge]', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/**
+ * GET /api/admin/instances/:id/data/export-download
+ * Same as /export but forces a JSON file download via Content-Disposition.
+ * Optionally filter by group: ?groups=sales,expenses
+ * Optionally filter by date range: ?from=ISO&to=ISO
+ */
+router.get('/instances/:id/data/export-download', async (req: Request, res: Response) => {
+  try {
+    const instance = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
+    if (!instance) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+    const { groups: groupsParam, from, to } = req.query as Record<string, string>;
+
+    let entityTypeFilter: string[] | undefined;
+    if (groupsParam) {
+      const groupKeys = groupsParam.split(',');
+      entityTypeFilter = groupKeys.flatMap(g => PURGEABLE_GROUPS[g]?.types ?? []);
+    }
+
+    const dateFilter: { gte?: Date; lte?: Date } = {};
+    if (from) { const d = new Date(from); if (!isNaN(d.getTime())) dateFilter.gte = d; }
+    if (to)   { const d = new Date(to);   if (!isNaN(d.getTime())) dateFilter.lte = d; }
+
+    const rawEvents = await prisma.syncEvent.findMany({
+      where: {
+        instance_id: req.params.id,
+        ...(entityTypeFilter ? { entity_type: { in: entityTypeFilter } } : {}),
+        ...(Object.keys(dateFilter).length ? { received_at: dateFilter } : {}),
+      },
+      orderBy: { id: 'asc' },
+      select: { entity_type: true, operation: true, payload: true, received_at: true },
+    });
+
+    // Build structured (deduplicated) export
+    const entityMap: Record<string, Map<string, any>> = {};
+    for (const event of rawEvents) {
+      const type = event.entity_type;
+      if (!entityMap[type]) entityMap[type] = new Map();
+      let payload: any;
+      try { payload = JSON.parse(event.payload); } catch { continue; }
+      if (!payload) continue;
+      const key = String(payload?.id ?? payload?.barcode ?? Math.random());
+      if (event.operation === 'delete') entityMap[type].delete(key);
+      else entityMap[type].set(key, payload);
+    }
+
+    const exportData: Record<string, any[]> = {};
+    for (const [singular, plural] of Object.entries(ENTITY_TO_TABLE)) {
+      exportData[plural] = Array.from((entityMap[singular] ?? new Map()).values());
+    }
+    for (const [type, items] of Object.entries(entityMap)) {
+      if (!ENTITY_TO_TABLE[type]) exportData[type] = Array.from(items.values());
+    }
+
+    const payload = {
+      _osatech_export: true,
+      exported_at: new Date().toISOString(),
+      instance: { instance_id: instance.instance_id, store_name: instance.store_name, owner_name: instance.owner_name },
+      data: exportData,
+      raw_events: rawEvents.length,
+    };
+
+    const slug = (instance.store_name || instance.instance_id).replace(/[^a-z0-9]/gi, '_');
+    const dateStr = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="${slug}_export_${dateStr}.json"`);
+    res.send(JSON.stringify(payload, null, 2));
+  } catch (e: any) {
+    console.error('[data/export-download]', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/**
+ * POST /api/admin/instances/:id/data/import
+ * Body: { data: Record<string, any[]>, receivedAt?: string, mode?: 'preview'|'skip'|'overwrite' }
+ *
+ * mode='preview'   → dry-run; detects conflicts (entity ids that already exist) without inserting.
+ * mode='skip'      → import only entities whose id does NOT already exist in sync_events.
+ * mode='overwrite' → (default) import all; newer events will always win in replay.
+ *
+ * Returns { batchId } — a string the client stores so it can undo the import later.
+ */
+router.post(
+  '/instances/:id/data/import',
+  express.json({ limit: '50mb' }),
+  async (req: Request, res: Response) => {
+    try {
+      const { data, receivedAt, mode = 'overwrite' } = req.body as {
+        data?: Record<string, any[]>;
+        receivedAt?: string;
+        mode?: 'preview' | 'skip' | 'overwrite';
+      };
+      if (!data || typeof data !== 'object') {
+        res.status(400).json({ success: false, error: '`data` object required' }); return;
+      }
+
+      const instance = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
+      if (!instance) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+      // Build reverse mapping: plural table name → singular entity_type
+      const TABLE_TO_ENTITY: Record<string, string> = {};
+      for (const [entity, table] of Object.entries(ENTITY_TO_TABLE)) TABLE_TO_ENTITY[table] = entity;
+
+      // Parse all incoming entities
+      const incoming: { entityType: string; entity: any; key: string }[] = [];
+      for (const [tableName, entities] of Object.entries(data)) {
+        if (!Array.isArray(entities) || entities.length === 0) continue;
+        const entityType = TABLE_TO_ENTITY[tableName] ?? tableName;
+        for (const entity of entities) {
+          if (!entity || typeof entity !== 'object') continue;
+          const key = String(entity?.id ?? entity?.barcode ?? Math.random());
+          incoming.push({ entityType, entity, key });
+        }
+      }
+
+      // Find existing entity keys already in sync_events for this instance
+      const entityTypes = [...new Set(incoming.map(e => e.entityType))];
+      const existingEvents = await prisma.syncEvent.findMany({
+        where: { instance_id: req.params.id, entity_type: { in: entityTypes } },
+        select: { entity_type: true, payload: true, operation: true },
+        orderBy: { id: 'asc' },
+      });
+
+      // Build set of existing keys per entity type (latest-wins replay)
+      const existingKeys = new Map<string, Set<string>>(); // entityType → Set<key>
+      for (const ev of existingEvents) {
+        if (!existingKeys.has(ev.entity_type)) existingKeys.set(ev.entity_type, new Set());
+        try {
+          const p = JSON.parse(ev.payload);
+          const key = String(p?.id ?? p?.barcode ?? '');
+          if (key) {
+            if (ev.operation === 'delete') existingKeys.get(ev.entity_type)!.delete(key);
+            else existingKeys.get(ev.entity_type)!.add(key);
+          }
+        } catch {}
+      }
+
+      // Classify incoming as new vs conflict
+      const conflicts: { entityType: string; key: string; entity: any }[] = [];
+      const newEntities: typeof incoming = [];
+      for (const item of incoming) {
+        const existing = existingKeys.get(item.entityType);
+        if (existing?.has(item.key)) conflicts.push(item);
+        else newEntities.push(item);
+      }
+
+      if (mode === 'preview') {
+        const byType: Record<string, { new: number; conflicts: number }> = {};
+        for (const item of newEntities) {
+          if (!byType[item.entityType]) byType[item.entityType] = { new: 0, conflicts: 0 };
+          byType[item.entityType].new++;
+        }
+        for (const item of conflicts) {
+          if (!byType[item.entityType]) byType[item.entityType] = { new: 0, conflicts: 0 };
+          byType[item.entityType].conflicts++;
+        }
+        res.json({
+          success: true,
+          preview: true,
+          total: incoming.length,
+          new_count: newEntities.length,
+          conflict_count: conflicts.length,
+          breakdown: byType,
+          sample_conflicts: conflicts.slice(0, 5).map(c => ({ entityType: c.entityType, key: c.key })),
+        });
+        return;
+      }
+
+      // Determine which entities to insert
+      const toInsert = mode === 'skip' ? newEntities : incoming;
+
+      const batchId = (receivedAt && !isNaN(new Date(receivedAt).getTime()))
+        ? new Date(receivedAt).toISOString()
+        : new Date().toISOString();
+      const atDate = new Date(batchId);
+
+      const events = toInsert.map(item => ({
+        instance_id: req.params.id,
+        entity_type: item.entityType,
+        operation: 'create' as const,
+        payload: JSON.stringify(item.entity),
+        received_at: atDate,
+      }));
+
+      let imported = 0;
+      const BATCH = 500;
+      for (let i = 0; i < events.length; i += BATCH) {
+        const result = await prisma.syncEvent.createMany({ data: events.slice(i, i + BATCH) });
+        imported += result.count;
+      }
+
+      res.json({
+        success: true,
+        imported,
+        skipped: mode === 'skip' ? conflicts.length : 0,
+        conflict_count: conflicts.length,
+        batch_id: batchId,
+      });
+    } catch (e: any) {
+      console.error('[data/import]', e.message);
+      res.status(500).json({ success: false, error: e.message });
+    }
+  }
+);
+
+/**
+ * DELETE /api/admin/instances/:id/data/import-batch
+ * Body: { batchId: string }
+ * Undoes an import by deleting all sync_events for this instance with
+ * received_at matching the batchId ISO timestamp exactly.
+ */
+router.delete('/instances/:id/data/import-batch', async (req: Request, res: Response) => {
+  try {
+    const { batchId } = req.body as { batchId?: string };
+    if (!batchId) { res.status(400).json({ success: false, error: 'batchId required' }); return; }
+    const batchDate = new Date(batchId);
+    if (isNaN(batchDate.getTime())) { res.status(400).json({ success: false, error: 'Invalid batchId' }); return; }
+
+    const instance = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
+    if (!instance) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+    // Delete events with exact received_at match (ISO precision)
+    const result = await prisma.syncEvent.deleteMany({
+      where: { instance_id: req.params.id, received_at: batchDate },
+    });
+
+    res.json({ success: true, deleted: result.count });
+  } catch (e: any) {
+    console.error('[data/import-batch delete]', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
 
 // Multi-device is handled via shared cloud credentials — no separate shop accounts needed.
 

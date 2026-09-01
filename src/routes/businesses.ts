@@ -121,6 +121,14 @@ router.post('/register-business', async (req: Request, res: Response) => {
       return;
     }
 
+    // Explicit signin with unknown mobile — don't auto-create an account.
+    // Old desktop clients omit `mode` entirely; only the web signin sends
+    // mode:'signin', so this guard doesn't affect first-time desktop setup.
+    if (mode === 'signin') {
+      res.status(404).json({ success: false, error: 'No account found for this mobile number. Please register your store first.' });
+      return;
+    }
+
     // New registration
     const instance_id    = uuidv4();
     const api_key        = uuidv4();
