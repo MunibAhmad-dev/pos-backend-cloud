@@ -2191,6 +2191,33 @@ router.post('/instances/:id/data/purge', async (req: Request, res: Response) => 
 });
 
 /**
+ * DELETE /api/admin/instances/:id/data/wipe
+ * Nuclear option — deletes ALL sync events and instance sales for this instance.
+ * The Instance record (license, credentials, store info) is preserved.
+ */
+router.delete('/instances/:id/data/wipe', async (req: Request, res: Response) => {
+  try {
+    const instance = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
+    if (!instance) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+    const [syncResult, saleResult] = await prisma.$transaction([
+      prisma.syncEvent.deleteMany({ where: { instance_id: req.params.id } }),
+      prisma.instanceSale.deleteMany({ where: { instance_id: req.params.id } }),
+    ]);
+
+    res.json({
+      success: true,
+      deleted: syncResult.count + saleResult.count,
+      sync_events: syncResult.count,
+      instance_sales: saleResult.count,
+    });
+  } catch (e: any) {
+    console.error('[data/wipe]', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/**
  * GET /api/admin/instances/:id/data/export-download
  * Same as /export but forces a JSON file download via Content-Disposition.
  * Optionally filter by group: ?groups=sales,expenses
