@@ -1,7 +1,8 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'fallback_dev_secret_change_in_production';
+// Guaranteed non-null by the startup check in index.ts
+const JWT_SECRET = process.env.JWT_SECRET!;
 
 export interface AdminPayload {
   id: number;
@@ -18,9 +19,8 @@ export interface MobilePayload {
   scope: 'mobile';   // distinguishes from admin tokens
 }
 
-const MOBILE_SECRET = process.env.MOBILE_JWT_SECRET
-  || process.env.JWT_SECRET
-  || 'fallback_mobile_secret';
+// Falls back to JWT_SECRET if MOBILE_JWT_SECRET not set (acceptable — same key, separable later)
+const MOBILE_SECRET = process.env.MOBILE_JWT_SECRET || process.env.JWT_SECRET!;
 
 export function signMobileToken(payload: MobilePayload): string {
   return jwt.sign(payload, MOBILE_SECRET, { expiresIn: '90d' });

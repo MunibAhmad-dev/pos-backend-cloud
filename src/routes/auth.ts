@@ -31,8 +31,8 @@ router.post('/setup', async (req: Request, res: Response) => {
     res.status(400).json({ success: false, error: 'username and password are required' });
     return;
   }
-  if (password.length < 6) {
-    res.status(400).json({ success: false, error: 'Password must be at least 6 characters' });
+  if (password.length < 8) {
+    res.status(400).json({ success: false, error: 'Password must be at least 8 characters' });
     return;
   }
 

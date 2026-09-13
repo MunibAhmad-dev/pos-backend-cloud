@@ -33,6 +33,12 @@ import manufacturingRoutes from './routes/manufacturing'; // Factory ERP (Air Co
 import vendorRoutes       from './routes/vendors';
 import customerRoutes     from './routes/customers';
 
+// ─── Startup env validation ───────────────────────────────────────────────────
+if (!process.env.JWT_SECRET) {
+  console.error('[FATAL] JWT_SECRET is not set. Add it to your .env file and restart.');
+  process.exit(1);
+}
+
 // Prisma client is lazily initialized on first use — no explicit bootstrap needed.
 
 const app  = express();
@@ -73,7 +79,12 @@ app.options('*', cors(corsOptions));
 app.use(cors(corsOptions));
 
 // ─── Security (after CORS so headers aren't overwritten) ─────────────────────
-app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(helmet({
+  contentSecurityPolicy: false,                           // API-only — no HTML served here
+  crossOriginResourcePolicy: { policy: 'cross-origin' }, // allow cross-origin API fetches
+  referrerPolicy: { policy: 'no-referrer' },
+  hsts: { maxAge: 63072000, includeSubDomains: true, preload: true },
+}));
 
 // ─── Body parsing ────────────────────────────────────────────────────────────
 app.use(express.json({ limit: '2mb' }));
@@ -97,18 +108,36 @@ const syncLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// Admin panel — sensitive operations; authenticated but still needs a ceiling
+const adminLimiter = rateLimit({
+  windowMs: 2 * 60 * 1000,    // 2 minutes
+  max: 60,
+  message: { success: false, error: 'Too many requests.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Low-traffic public/semi-public routes
+const publicLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  message: { success: false, error: 'Too many requests — please slow down.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // ─── Routes ──────────────────────────────────────────────────────────────────
-app.use('/api/auth',       authLimiter,  authRoutes);
-app.use('/api/instances',  syncLimiter,  instanceRoutes);
-app.use('/api/sync',       syncLimiter,  syncRoutes);
-app.use('/api/admin',                   adminRoutes);
-app.use('/api/updates',                 updateRoutes);   // public — no auth
-app.use('/api/branches',                branchRoutes);
-app.use('/api',                         businessRoutes);
+app.use('/api/auth',          authLimiter,   authRoutes);
+app.use('/api/instances',     syncLimiter,   instanceRoutes);
+app.use('/api/sync',          syncLimiter,   syncRoutes);
+app.use('/api/admin',         adminLimiter,  adminRoutes);
+app.use('/api/updates',       publicLimiter, updateRoutes);
+app.use('/api/branches',      publicLimiter, branchRoutes);
+app.use('/api',               publicLimiter, businessRoutes);
 // APIs for the Manufacturing app (Factory ERP) — see routes/manufacturing/
-app.use('/api/manufacturing',           manufacturingRoutes);
-app.use('/api/vendors',    syncLimiter, vendorRoutes);
-app.use('/api/customers',  syncLimiter, customerRoutes);
+app.use('/api/manufacturing', syncLimiter,   manufacturingRoutes);
+app.use('/api/vendors',       syncLimiter,   vendorRoutes);
+app.use('/api/customers',     syncLimiter,   customerRoutes);
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'pos-backend-cloud', timestamp: new Date().toISOString() });
