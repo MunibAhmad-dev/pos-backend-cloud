@@ -245,6 +245,68 @@ model ManufacturingInstanceSale {
   @@index([instance_id])
 }
 
+// ─── Mercy College of Nursing ────────────────────────────────────────────────
+// Separate admission portal — student accounts + applications + document uploads.
+// Entirely isolated from POS data; only shares the same PostgreSQL database.
+
+model MercyUser {
+  id            Int      @id @default(autoincrement())
+  name          String
+  cnic          String   @unique
+  phone         String
+  email         String   @unique
+  password_hash String
+  role          String   @default("student")  // student | admin
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  application   MercyApplication?
+
+  @@map("mercy_users")
+  @@index([email])
+  @@index([cnic])
+}
+
+model MercyApplication {
+  id             Int      @id @default(autoincrement())
+  user_id        Int      @unique
+
+  // Personal info
+  father_name    String   @default("")
+  dob            String   @default("")
+  gender         String   @default("")
+  address        String   @default("")
+
+  // Academic info
+  qualification  String   @default("")
+  program        String   @default("")    // BSN | LHV
+  marks_matric   Float    @default(0)
+  marks_fsc      Float?                   // optional
+
+  // Application lifecycle
+  status         String   @default("pending")  // pending | under_review | verified | rejected | allocated
+  merit_rank     Int?
+  admin_note     String   @default("")
+
+  // Uploaded file paths (relative, served via /api/mercy/uploads/:file)
+  profile_picture String?
+  cnic_doc        String?    // CNIC / Form-B
+  domicile_doc    String?    // Domicile certificate
+  matric_docs     String?    // JSON array of file paths
+  fsc_docs        String?    // JSON array of file paths (optional)
+  kmu_cat_doc     String?    // KMU CAT result
+
+  submitted_at   DateTime?
+  created_at     DateTime @default(now())
+  updated_at     DateTime @updatedAt
+
+  user           MercyUser @relation(fields: [user_id], references: [id])
+
+  @@map("mercy_applications")
+  @@index([status])
+  @@index([program])
+}
+
 model BranchRequest {
   id          Int      @id @default(autoincrement())
   instance_id String

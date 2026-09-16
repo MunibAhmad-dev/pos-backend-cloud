@@ -32,6 +32,7 @@ import branchRoutes    from './routes/branches';
 import manufacturingRoutes from './routes/manufacturing'; // Factory ERP (Air Cooler Manufacturing) app — shares this backend with the POS
 import vendorRoutes       from './routes/vendors';
 import customerRoutes     from './routes/customers';
+import mercyRoutes        from './routes/mercy';       // Mercy College of Nursing admission portal
 
 // ─── Startup env validation ───────────────────────────────────────────────────
 if (!process.env.JWT_SECRET) {
@@ -138,6 +139,7 @@ app.use('/api',               publicLimiter, businessRoutes);
 app.use('/api/manufacturing', syncLimiter,   manufacturingRoutes);
 app.use('/api/vendors',       syncLimiter,   vendorRoutes);
 app.use('/api/customers',     syncLimiter,   customerRoutes);
+app.use('/api/mercy',         publicLimiter, mercyRoutes);   // Mercy College of Nursing
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'pos-backend-cloud', timestamp: new Date().toISOString() });
