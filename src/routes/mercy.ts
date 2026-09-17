@@ -452,6 +452,42 @@ router.get('/admin/stats', requireMercyAdmin, async (_req: Request, res: Respons
 });
 
 /**
+ * GET /api/mercy/admin/students
+ * All registered student accounts, with their application status if any.
+ * Query params: search?, limit?, offset?
+ */
+router.get('/admin/students', requireMercyAdmin, async (req: Request, res: Response) => {
+  try {
+    const { search, limit = '100', offset = '0' } = req.query as Record<string, string>;
+    const where: any = { role: 'student' };
+    if (search?.trim()) {
+      where.OR = [
+        { name:  { contains: search.trim(), mode: 'insensitive' } },
+        { cnic:  { contains: search.trim(), mode: 'insensitive' } },
+        { email: { contains: search.trim(), mode: 'insensitive' } },
+        { phone: { contains: search.trim(), mode: 'insensitive' } },
+      ];
+    }
+    const [students, total] = await Promise.all([
+      prisma.mercyUser.findMany({
+        where,
+        select: {
+          id: true, name: true, cnic: true, phone: true, email: true, created_at: true,
+          application: { select: { id: true, status: true, program: true, submitted_at: true } },
+        },
+        orderBy: { created_at: 'desc' },
+        take: Math.min(Number(limit), 500),
+        skip: Number(offset),
+      }),
+      prisma.mercyUser.count({ where }),
+    ]);
+    res.json({ success: true, data: students, total });
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/**
  * GET /api/mercy/admin/applications
  * Query params: status?, program?, search?, limit?, offset?
  */
