@@ -127,6 +127,16 @@ const publicLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// Mercy College admission portal — higher limit because a single page load
+// fetches several protected files (profile pic + documents) in parallel.
+const mercyLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 300,
+  message: { success: false, error: 'Too many requests — please slow down.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // ─── Routes ──────────────────────────────────────────────────────────────────
 app.use('/api/auth',          authLimiter,   authRoutes);
 app.use('/api/instances',     syncLimiter,   instanceRoutes);
@@ -134,12 +144,15 @@ app.use('/api/sync',          syncLimiter,   syncRoutes);
 app.use('/api/admin',         adminLimiter,  adminRoutes);
 app.use('/api/updates',       publicLimiter, updateRoutes);
 app.use('/api/branches',      publicLimiter, branchRoutes);
-app.use('/api',               publicLimiter, businessRoutes);
 // APIs for the Manufacturing app (Factory ERP) — see routes/manufacturing/
 app.use('/api/manufacturing', syncLimiter,   manufacturingRoutes);
 app.use('/api/vendors',       syncLimiter,   vendorRoutes);
 app.use('/api/customers',     syncLimiter,   customerRoutes);
-app.use('/api/mercy',         publicLimiter, mercyRoutes);   // Mercy College of Nursing
+// Mercy College of Nursing — must come BEFORE the generic /api catch-all so
+// requests aren't double-counted by the publicLimiter on that line.
+app.use('/api/mercy',         mercyLimiter,  mercyRoutes);
+// Generic /api catch-all — keep last so specific prefixes above take priority
+app.use('/api',               publicLimiter, businessRoutes);
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'pos-backend-cloud', timestamp: new Date().toISOString() });

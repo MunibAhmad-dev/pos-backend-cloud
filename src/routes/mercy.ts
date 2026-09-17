@@ -352,23 +352,13 @@ router.post('/student/application', requireMercyAuth, (req: Request, res: Respon
       return;
     }
 
-    // Validate required documents for new submissions
+    // Fetch existing application (for upsert + keeping old files)
     const existing = await prisma.mercyApplication.findUnique({ where: { user_id: id } });
-    if (!existing) {
-      const requiredDocs: Record<string, string> = {
-        profilePicture: 'Profile picture',
-        cnicFront:      'CNIC front photo',
-        cnicBack:       'CNIC back photo',
-        domicile:       'Domicile certificate',
-        matricDocs:     'Matric DMC / certificate',
-        kmuCat:         'KMU CAT result',
-      };
-      for (const [field, label] of Object.entries(requiredDocs)) {
-        if (!files?.[field]?.length) {
-          res.status(400).json({ success: false, error: `${label} is required` });
-          return;
-        }
-      }
+
+    // Profile picture is the only document required on a brand-new submission
+    if (!existing && !files?.['profilePicture']?.length) {
+      res.status(400).json({ success: false, error: 'Profile picture is required' });
+      return;
     }
 
     // Build document fields — keep existing if no new upload provided
@@ -643,6 +633,34 @@ router.get('/admin/students/:id/credentials', requireMercyAdmin, async (req: Req
       return;
     }
     res.json({ success: true, data: user });
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/**
+ * POST /api/mercy/admin/students/:id/reset-password
+ * Admin sets a new password for a student; saves hash + plain copy.
+ */
+router.post('/admin/students/:id/reset-password', requireMercyAdmin, async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    const { new_password } = req.body as { new_password?: string };
+    if (!new_password || new_password.trim().length < 6) {
+      res.status(400).json({ success: false, error: 'Password must be at least 6 characters' });
+      return;
+    }
+    const user = await prisma.mercyUser.findUnique({ where: { id } });
+    if (!user || user.role !== 'student') {
+      res.status(404).json({ success: false, error: 'Student not found' });
+      return;
+    }
+    const hash = await bcrypt.hash(new_password.trim(), 10);
+    await prisma.mercyUser.update({
+      where: { id },
+      data: { password_hash: hash, password_plain: new_password.trim() },
+    });
+    res.json({ success: true, message: 'Password updated' });
   } catch (e: any) {
     res.status(500).json({ success: false, error: e.message });
   }
