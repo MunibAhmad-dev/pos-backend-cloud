@@ -827,13 +827,16 @@ router.delete('/admin/data', requireMercyAdmin, async (req: Request, res: Respon
     const appCount  = await prisma.mercyApplication.count();
     const userCount = await prisma.mercyUser.count({ where: { role: 'student' } });
 
-    // 1. Delete all applications (must come first due to FK → mercy_users)
+    // 1. Delete status logs first (FK → mercy_applications)
+    await prisma.mercyStatusLog.deleteMany({});
+
+    // 2. Delete all applications (FK → mercy_users)
     await prisma.mercyApplication.deleteMany({});
 
-    // 2. Delete all student accounts (preserve admin accounts)
+    // 3. Delete all student accounts (preserve admin accounts)
     await prisma.mercyUser.deleteMany({ where: { role: 'student' } });
 
-    // 3. Delete all uploaded files from disk
+    // 4. Delete all uploaded files from disk
     let filesDeleted = 0;
     try {
       const files = fs.readdirSync(MERCY_UPLOADS_DIR);
