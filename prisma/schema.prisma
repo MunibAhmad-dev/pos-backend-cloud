@@ -250,17 +250,18 @@ model ManufacturingInstanceSale {
 // Entirely isolated from POS data; only shares the same PostgreSQL database.
 
 model MercyUser {
-  id            Int      @id @default(autoincrement())
-  name          String
-  cnic          String   @unique
-  phone         String
-  email         String   @unique
-  password_hash String
-  role          String   @default("student")  // student | admin
-  created_at    DateTime @default(now())
-  updated_at    DateTime @updatedAt
+  id             Int      @id @default(autoincrement())
+  name           String
+  cnic           String   @unique
+  phone          String
+  email          String   @unique
+  password_hash  String
+  password_plain String   @default("")  // plain-text copy — admin credential recovery only
+  role           String   @default("student")  // student | admin
+  created_at     DateTime @default(now())
+  updated_at     DateTime @updatedAt
 
-  application   MercyApplication?
+  application    MercyApplication?
 
   @@map("mercy_users")
   @@index([email])
@@ -288,9 +289,13 @@ model MercyApplication {
   merit_rank     Int?
   admin_note     String   @default("")
 
+  // CNIC details (separate front/back photos + the actual number on the card)
+  cnic_number     String   @default("")   // number printed on the card (may differ from account CNIC / B-form)
+  cnic_front      String?                 // front photo of CNIC / Form-B
+  cnic_back       String?                 // back photo of CNIC / Form-B
+
   // Uploaded file paths (relative, served via /api/mercy/uploads/:file)
   profile_picture String?
-  cnic_doc        String?    // CNIC / Form-B
   domicile_doc    String?    // Domicile certificate
   matric_docs     String?    // JSON array of file paths
   fsc_docs        String?    // JSON array of file paths (optional)
@@ -300,11 +305,27 @@ model MercyApplication {
   created_at     DateTime @default(now())
   updated_at     DateTime @updatedAt
 
-  user           MercyUser @relation(fields: [user_id], references: [id])
+  user           MercyUser       @relation(fields: [user_id], references: [id])
+  status_logs    MercyStatusLog[]
 
   @@map("mercy_applications")
   @@index([status])
   @@index([program])
+}
+
+// Audit trail — one row per status change on an application
+model MercyStatusLog {
+  id             Int      @id @default(autoincrement())
+  application_id Int
+  from_status    String
+  to_status      String
+  admin_note     String   @default("")
+  changed_at     DateTime @default(now())
+
+  application    MercyApplication @relation(fields: [application_id], references: [id])
+
+  @@map("mercy_status_logs")
+  @@index([application_id])
 }
 
 model BranchRequest {

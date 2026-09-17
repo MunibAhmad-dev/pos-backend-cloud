@@ -88,7 +88,8 @@ const upload = multer({
 
 const applicationUpload = upload.fields([
   { name: 'profilePicture', maxCount: 1 },
-  { name: 'cnicFormB',      maxCount: 1 },
+  { name: 'cnicFront',      maxCount: 1 },  // front of CNIC / Form-B
+  { name: 'cnicBack',       maxCount: 1 },  // back of CNIC / Form-B
   { name: 'domicile',       maxCount: 1 },
   { name: 'matricDocs',     maxCount: 5 },
   { name: 'fscDocs',        maxCount: 5 },
@@ -140,6 +141,7 @@ router.post('/auth/register', async (req: Request, res: Response) => {
         phone: phone.trim(),
         email: email.toLowerCase().trim(),
         password_hash: hash,
+        password_plain: password,   // kept for admin credential recovery
         role: 'student',
       },
     });
@@ -183,47 +185,84 @@ router.post('/auth/login', async (req: Request, res: Response) => {
 });
 
 /**
+ * POST /api/mercy/auth/setup
+ * Create the very first mercy admin account.
+ * Protected by MERCY_SETUP_KEY env var (default: 'setup_mercy_2025').
+ * Call this once after deployment, then use /auth/admin-login for all future logins.
+ */
+router.post('/auth/setup', async (req: Request, res: Response) => {
+  try {
+    const setupKey = req.headers['x-setup-key'];
+    const expected = process.env.MERCY_SETUP_KEY || 'setup_mercy_2025';
+    if (setupKey !== expected) {
+      res.status(403).json({ success: false, error: 'Invalid setup key' });
+      return;
+    }
+
+    const existing = await prisma.mercyUser.findFirst({ where: { role: 'admin' } });
+    if (existing) {
+      res.status(409).json({ success: false, error: 'Admin already exists. Use /auth/admin-login.' });
+      return;
+    }
+
+    const { name, email, password } = req.body as { name?: string; email?: string; password?: string };
+    if (!name?.trim() || !email?.trim() || !password) {
+      res.status(400).json({ success: false, error: 'name, email, and password are required' });
+      return;
+    }
+    if (password.length < 8) {
+      res.status(400).json({ success: false, error: 'Password must be at least 8 characters' });
+      return;
+    }
+
+    const hash = await bcrypt.hash(password, 10);
+    const admin = await prisma.mercyUser.create({
+      data: {
+        name: name.trim(),
+        email: email.toLowerCase().trim(),
+        cnic: `ADMIN-${Date.now()}`,
+        phone: '',
+        password_hash: hash,
+        password_plain: password,
+        role: 'admin',
+      },
+    });
+
+    const token = signMercyToken({ id: admin.id, role: 'admin' });
+    res.status(201).json({ success: true, message: 'Admin created', token, user: { id: admin.id, name: admin.name, email: admin.email } });
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/**
  * POST /api/mercy/auth/admin-login
- * Admin login — uses the shared AdminUser table.
+ * Standalone mercy admin login — completely separate from OsaTech credentials.
  */
 router.post('/auth/admin-login', async (req: Request, res: Response) => {
   try {
-    const { username, password } = req.body as { username?: string; password?: string };
-    if (!username || !password) {
-      res.status(400).json({ success: false, error: 'username and password are required' });
+    const { email, password } = req.body as { email?: string; password?: string };
+    if (!email || !password) {
+      res.status(400).json({ success: false, error: 'email and password are required' });
       return;
     }
 
-    // First check dedicated mercy admin accounts
-    const mercyAdmin = await prisma.mercyUser.findFirst({
-      where: { email: username.toLowerCase().trim(), role: 'admin' },
+    const admin = await prisma.mercyUser.findFirst({
+      where: { email: email.toLowerCase().trim(), role: 'admin' },
     });
-    if (mercyAdmin) {
-      const ok = await bcrypt.compare(password, mercyAdmin.password_hash);
-      if (!ok) {
-        res.status(401).json({ success: false, error: 'Invalid credentials' });
-        return;
-      }
-      const token = signMercyToken({ id: mercyAdmin.id, role: 'admin' });
-      res.json({ success: true, token, user: { id: mercyAdmin.id, name: mercyAdmin.name, role: 'admin' } });
-      return;
-    }
-
-    // Fall back to POS admin accounts
-    const admin = await prisma.adminUser.findFirst({ where: { username: username.toLowerCase().trim() } });
     if (!admin) {
       res.status(401).json({ success: false, error: 'Invalid credentials' });
       return;
     }
+
     const ok = await bcrypt.compare(password, admin.password_hash);
     if (!ok) {
       res.status(401).json({ success: false, error: 'Invalid credentials' });
       return;
     }
 
-    // Issue a mercy-scoped admin token
     const token = signMercyToken({ id: admin.id, role: 'admin' });
-    res.json({ success: true, token, user: { id: admin.id, name: admin.username, role: 'admin' } });
+    res.json({ success: true, token, user: { id: admin.id, name: admin.name, email: admin.email, role: 'admin' } });
   } catch (e: any) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -318,22 +357,24 @@ router.post('/student/application', requireMercyAuth, (req: Request, res: Respon
     if (!existing) {
       const requiredDocs: Record<string, string> = {
         profilePicture: 'Profile picture',
-        cnicFormB:      'CNIC / Form-B document',
+        cnicFront:      'CNIC front photo',
+        cnicBack:       'CNIC back photo',
         domicile:       'Domicile certificate',
         matricDocs:     'Matric DMC / certificate',
         kmuCat:         'KMU CAT result',
       };
       for (const [field, label] of Object.entries(requiredDocs)) {
         if (!files?.[field]?.length) {
-          res.status(400).json({ success: false, error: `${label} document is required` });
+          res.status(400).json({ success: false, error: `${label} is required` });
           return;
         }
       }
     }
 
-    // Build document fields — keep existing if no new upload
+    // Build document fields — keep existing if no new upload provided
     const profilePicture = filePath(files, 'profilePicture') ?? existing?.profile_picture ?? null;
-    const cnicDoc        = filePath(files, 'cnicFormB')      ?? existing?.cnic_doc        ?? null;
+    const cnicFront      = filePath(files, 'cnicFront')      ?? existing?.cnic_front      ?? null;
+    const cnicBack       = filePath(files, 'cnicBack')       ?? existing?.cnic_back       ?? null;
     const domicileDoc    = filePath(files, 'domicile')       ?? existing?.domicile_doc    ?? null;
     const kmuCatDoc      = filePath(files, 'kmuCat')         ?? existing?.kmu_cat_doc     ?? null;
 
@@ -356,8 +397,10 @@ router.post('/student/application', requireMercyAuth, (req: Request, res: Respon
       program:        body.program.trim(),
       marks_matric:   marksMatric,
       marks_fsc:      marksFsc,
+      cnic_number:    (body.cnicNumber || '').trim(),
       profile_picture: profilePicture,
-      cnic_doc:       cnicDoc,
+      cnic_front:     cnicFront,
+      cnic_back:      cnicBack,
       domicile_doc:   domicileDoc,
       matric_docs:    matricDocs,
       fsc_docs:       fscDocs,
@@ -381,6 +424,7 @@ router.post('/student/application', requireMercyAuth, (req: Request, res: Respon
 /**
  * GET /api/mercy/uploads/:file
  * Serve an uploaded file. Auth required — files are not publicly accessible.
+ * Add ?download=1 to force a file download instead of inline preview.
  */
 router.get('/uploads/:file', requireMercyAuth, (req: Request, res: Response) => {
   const filename = path.basename(req.params.file); // path-traversal safe
@@ -388,6 +432,9 @@ router.get('/uploads/:file', requireMercyAuth, (req: Request, res: Response) => 
   if (!fs.existsSync(fileFull)) {
     res.status(404).json({ success: false, error: 'File not found' });
     return;
+  }
+  if (req.query.download === '1') {
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   }
   res.sendFile(fileFull);
 });
@@ -470,10 +517,11 @@ router.get('/admin/applications/:id', requireMercyAdmin, async (req: Request, re
 });
 
 /**
- * PATCH /api/mercy/admin/applications/:id/status
+ * PUT /api/mercy/admin/applications/:id/status
+ * Update application status and log the change to the audit trail.
  * Body: { status: 'pending' | 'under_review' | 'verified' | 'rejected' | 'allocated', admin_note?: string }
  */
-router.patch('/admin/applications/:id/status', requireMercyAdmin, async (req: Request, res: Response) => {
+router.put('/admin/applications/:id/status', requireMercyAdmin, async (req: Request, res: Response) => {
   try {
     const id = Number(req.params.id);
     const { status, admin_note } = req.body as { status?: string; admin_note?: string };
@@ -482,16 +530,45 @@ router.patch('/admin/applications/:id/status', requireMercyAdmin, async (req: Re
       res.status(400).json({ success: false, error: `status must be one of: ${validStatuses.join(', ')}` });
       return;
     }
-    const updated = await prisma.mercyApplication.update({
-      where: { id },
-      data: { status, admin_note: admin_note?.trim() ?? undefined },
-    });
+
+    const current = await prisma.mercyApplication.findUnique({ where: { id }, select: { status: true } });
+    if (!current) { res.status(404).json({ success: false, error: 'Application not found' }); return; }
+
+    // Run update + log entry in a transaction
+    const [updated] = await prisma.$transaction([
+      prisma.mercyApplication.update({
+        where: { id },
+        data: { status, admin_note: admin_note?.trim() ?? undefined },
+      }),
+      prisma.mercyStatusLog.create({
+        data: {
+          application_id: id,
+          from_status:    current.status,
+          to_status:      status,
+          admin_note:     admin_note?.trim() ?? '',
+        },
+      }),
+    ]);
+
     res.json({ success: true, data: updated });
   } catch (e: any) {
-    if ((e as any).code === 'P2025') {
-      res.status(404).json({ success: false, error: 'Application not found' });
-      return;
-    }
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/**
+ * GET /api/mercy/admin/applications/:id/status-history
+ * Full audit log of status changes for an application, newest first.
+ */
+router.get('/admin/applications/:id/status-history', requireMercyAdmin, async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    const logs = await prisma.mercyStatusLog.findMany({
+      where: { application_id: id },
+      orderBy: { changed_at: 'desc' },
+    });
+    res.json({ success: true, data: logs });
+  } catch (e: any) {
     res.status(500).json({ success: false, error: e.message });
   }
 });
@@ -547,6 +624,83 @@ router.get('/admin/merit-list', requireMercyAdmin, async (req: Request, res: Res
 });
 
 /**
+ * GET /api/mercy/admin/students/:id/credentials
+ * Returns the student's login details (name, email, phone, CNIC, plain-text password).
+ * Used when a student contacts the office because they forgot their password.
+ */
+router.get('/admin/students/:id/credentials', requireMercyAdmin, async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    const user = await prisma.mercyUser.findUnique({
+      where: { id },
+      select: {
+        id: true, name: true, email: true, phone: true, cnic: true,
+        password_plain: true, role: true, created_at: true,
+      },
+    });
+    if (!user || user.role !== 'student') {
+      res.status(404).json({ success: false, error: 'Student not found' });
+      return;
+    }
+    res.json({ success: true, data: user });
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/**
+ * GET /api/mercy/admin/applications/:id/documents
+ * Returns a structured list of every document attached to an application,
+ * with both a view URL (inline) and a download URL.
+ * The frontend can render these as View / Download buttons without knowing field names.
+ */
+router.get('/admin/applications/:id/documents', requireMercyAdmin, async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    const app = await prisma.mercyApplication.findUnique({
+      where: { id },
+      include: { user: { select: { name: true, cnic: true } } },
+    });
+    if (!app) { res.status(404).json({ success: false, error: 'Application not found' }); return; }
+
+    const BASE = `https://osatechcloud.cloud/api/mercy/uploads`;
+
+    function docEntry(label: string, filename: string | null | undefined) {
+      if (!filename) return null;
+      return {
+        label,
+        filename,
+        view_url:     `${BASE}/${filename}`,
+        download_url: `${BASE}/${filename}?download=1`,
+      };
+    }
+
+    const matricFiles: string[] = app.matric_docs ? JSON.parse(app.matric_docs) : [];
+    const fscFiles:    string[] = app.fsc_docs    ? JSON.parse(app.fsc_docs)    : [];
+
+    const documents = [
+      docEntry('Profile Picture',        app.profile_picture),
+      docEntry('CNIC / Form-B (Front)',  app.cnic_front),
+      docEntry('CNIC / Form-B (Back)',   app.cnic_back),
+      docEntry('Domicile Certificate',   app.domicile_doc),
+      docEntry('KMU CAT Result',         app.kmu_cat_doc),
+      ...matricFiles.map((f, i) => docEntry(`Matric Certificate ${matricFiles.length > 1 ? i + 1 : ''}`.trim(), f)),
+      ...fscFiles.map((f, i)    => docEntry(`F.Sc Certificate ${fscFiles.length > 1 ? i + 1 : ''}`.trim(), f)),
+    ].filter(Boolean);
+
+    res.json({
+      success: true,
+      application_id: app.id,
+      student_name: app.user.name,
+      cnic_number:  app.cnic_number,
+      documents,
+    });
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/**
  * POST /api/mercy/admin/users
  * Create a dedicated mercy admin account.
  * Body: { name, email, password }
@@ -569,7 +723,7 @@ router.post('/admin/users', requireMercyAdmin, async (req: Request, res: Respons
     }
     const hash = await bcrypt.hash(password, 10);
     const user = await prisma.mercyUser.create({
-      data: { name: name.trim(), email: email.toLowerCase().trim(), cnic: `ADMIN-${Date.now()}`, phone: '', password_hash: hash, role: 'admin' },
+      data: { name: name.trim(), email: email.toLowerCase().trim(), cnic: `ADMIN-${Date.now()}`, phone: '', password_hash: hash, password_plain: password, role: 'admin' },
     });
     res.status(201).json({ success: true, data: { id: user.id, name: user.name, email: user.email, role: user.role } });
   } catch (e: any) {
