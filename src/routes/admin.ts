@@ -1419,8 +1419,14 @@ router.get('/analytics', async (req: Request, res: Response) => {
         END AS period,
         COUNT(*)::int AS count
       FROM instances
-      GROUP BY period
-      ORDER BY CASE period WHEN 'Today' THEN 1 WHEN 'This Week' THEN 2 WHEN 'This Month' THEN 3 WHEN 'Older' THEN 4 ELSE 5 END
+      GROUP BY 1
+      ORDER BY CASE
+        WHEN last_seen >= NOW() - INTERVAL '1 day'   THEN 1
+        WHEN last_seen >= NOW() - INTERVAL '7 days'  THEN 2
+        WHEN last_seen >= NOW() - INTERVAL '30 days' THEN 3
+        WHEN last_seen IS NOT NULL                   THEN 4
+        ELSE 5
+      END
     `),
 
     // 3. Plan distribution
