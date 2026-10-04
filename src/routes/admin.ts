@@ -2457,6 +2457,38 @@ router.delete('/instances/:id/data/import-batch', async (req: Request, res: Resp
   }
 });
 
+// ─── Instance deletion log ────────────────────────────────────────────────────
+
+/**
+ * GET /admin/instances/:id/deletion-log
+ * Returns the list of data categories this shop has selectively deleted locally.
+ */
+router.get('/instances/:id/deletion-log', requireAdmin, async (req: Request, res: Response) => {
+  const instance = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
+  if (!instance) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  let categories: string[] = [];
+  try { categories = JSON.parse(instance.deleted_categories || '[]'); } catch {}
+
+  res.json({ success: true, deleted_categories: categories });
+});
+
+/**
+ * DELETE /admin/instances/:id/deletion-log
+ * Resets the deletion log — the next pull-data will include all entity types again.
+ */
+router.delete('/instances/:id/deletion-log', requireAdmin, async (req: Request, res: Response) => {
+  const instance = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
+  if (!instance) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  await prisma.instance.update({
+    where: { instance_id: req.params.id },
+    data: { deleted_categories: '[]' },
+  });
+
+  res.json({ success: true, message: 'Deletion log cleared — all data categories will be included on next pull.' });
+});
+
 // Multi-device is handled via shared cloud credentials — no separate shop accounts needed.
 
 export default router;

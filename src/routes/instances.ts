@@ -898,11 +898,52 @@ router.get('/cloud-sales', requireInstance as any, async (req: Request, res: Res
 });
 
 /**
+ * POST /api/instances/report-deletion
+ *
+ * POS calls this after a selective delete to tell the cloud which data
+ * categories were wiped. pull-data will then skip entity types for those
+ * categories so the data is never re-pulled.
+ */
+const CATEGORY_ENTITY_TYPES: Record<string, string[]> = {
+  sales:             ['sale', 'sale_item', 'sale_return', 'sale_return_item', 'customer_payment'],
+  customer_ledger:   ['customer_payment'],
+  customer_balances: ['customer_payment'],
+  customers:         ['customer', 'customer_payment'],
+  khata:             ['customer_khata'],
+  products:          ['product', 'inventory_batch'],
+  stock_only:        [],
+  vendors_purchases: ['vendor', 'purchase', 'purchase_return', 'purchase_return_item', 'inventory_batch', 'vendor_payment'],
+  expenses:          ['expense'],
+  employees:         ['employee'],
+};
+
+router.post('/report-deletion', requireInstance as any, async (req: Request, res: Response) => {
+  const instance = (req as any).instance;
+  const { categories } = req.body as { categories?: string[] };
+  if (!Array.isArray(categories) || categories.length === 0) {
+    res.status(400).json({ success: false, error: 'categories array required' });
+    return;
+  }
+
+  let existing: string[] = [];
+  try { existing = JSON.parse(instance.deleted_categories || '[]'); } catch {}
+  const merged = Array.from(new Set([...existing, ...categories]));
+
+  await prisma.instance.update({
+    where: { instance_id: instance.instance_id },
+    data: { deleted_categories: JSON.stringify(merged) },
+  });
+
+  res.json({ success: true, deleted_categories: merged });
+});
+
+/**
  * GET /api/instances/pull-data
  *
  * Returns deduplicated records from sync_events for this instance.
  * The POS uses INSERT OR IGNORE when merging so existing local rows
  * are never overwritten — only missing records are added.
+ * Entity types for categories the shop has selectively deleted are excluded.
  *
  * Query: ?since=<ISO>  (default: epoch — pull everything ever synced)
  */
@@ -953,9 +994,17 @@ router.get('/pull-data', requireInstance as any, async (req: Request, res: Respo
   // Worse, since those devices' local copy never got removed, their own
   // periodic full-resync would re-push it as a "new" create, resurrecting
   // it everywhere on the next pull. `deleted` below closes that hole.
+  // Build the set of entity types to skip for categories this shop deleted
+  let deletedCats: string[] = [];
+  try { deletedCats = JSON.parse(instance.deleted_categories || '[]'); } catch {}
+  const blockedEntityTypes = new Set<string>(
+    deletedCats.flatMap(cat => CATEGORY_ENTITY_TYPES[cat] ?? [])
+  );
+
   const entityMap: Record<string, Map<string, any>> = {};
   const deletedMap: Record<string, Set<string>> = {};
   for (const ev of page) {
+    if (blockedEntityTypes.has(ev.entity_type)) continue;
     if (!entityMap[ev.entity_type]) entityMap[ev.entity_type] = new Map();
     if (!deletedMap[ev.entity_type]) deletedMap[ev.entity_type] = new Set();
     let payload: any;
