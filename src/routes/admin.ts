@@ -1073,7 +1073,18 @@ router.get('/instances/:id/settings', async (req: Request, res: Response) => {
   const settingsEvents = await parseEntityFromSync(req.params.id, 'settings');
   const syncedSettings: any = settingsEvents[0] ?? null;
 
-  // Always return instance-level fields as fallback
+  const MODULE_KEYS = [
+    'wholesale', 'pharmacy', 'accounting', 'attendance', 'bakery',
+    'grocery', 'restaurant', 'clothing', 'electronics', 'accessories',
+    'dry_fruits', 'paint', 'mobile', 'laptop', 'urdu',
+  ];
+  const modules: Record<string, boolean> = {};
+  for (const m of MODULE_KEYS) {
+    const key = `${m}_module_enabled`;
+    modules[m] = !!(syncedSettings?.[key] ?? 0);
+  }
+  const enabledModules = MODULE_KEYS.filter(m => modules[m]);
+
   res.json({
     success: true,
     data: {
@@ -1084,15 +1095,22 @@ router.get('/instances/:id/settings', async (req: Request, res: Response) => {
       owner_email:     syncedSettings?.owner_email     || instance.owner_email,
       store_address:   syncedSettings?.store_address   || instance.store_address,
       business_name:   syncedSettings?.business_name   || instance.business_name,
-      // ── From synced settings (only available if POS uploaded full data) ───
-      store_phone:     syncedSettings?.store_phone     || instance.owner_mobile || null,
-      receipt_footer:  syncedSettings?.receipt_footer  || null,
+      // ── From synced settings ──────────────────────────────────────────────
+      store_phone:       syncedSettings?.store_phone     || instance.owner_mobile || null,
+      receipt_footer:    syncedSettings?.receipt_footer  || null,
+      currency:          syncedSettings?.currency        || 'PKR',
+      tax_rate:          syncedSettings?.tax_rate        ?? null,
+      low_stock_threshold: syncedSettings?.low_stock_threshold ?? null,
+      // ── License & version ────────────────────────────────────────────────
       branch_name:     instance.branch_name,
       license_plan:    instance.license_plan,
       license_expiry:  instance.license_expiry,
       app_version:     instance.app_version,
       last_seen:       instance.last_seen,
       synced_from_pos: !!syncedSettings,
+      // ── Modules ───────────────────────────────────────────────────────────
+      modules,
+      enabled_modules: enabledModules,
     },
   });
 });
