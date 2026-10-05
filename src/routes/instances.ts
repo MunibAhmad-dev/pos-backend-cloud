@@ -909,10 +909,11 @@ const CATEGORY_ENTITY_TYPES: Record<string, string[]> = {
   customer_ledger:   ['customer_payment'],
   customer_balances: ['customer_payment'],
   customers:         ['customer', 'customer_payment'],
-  khata:             ['customer_khata'],
+  khata:             ['customer_khata', 'customer_khata_payment'],
+  route_book:        ['customer_location', 'customer_location_member'],
   products:          ['product', 'inventory_batch'],
   stock_only:        [],
-  vendors_purchases: ['vendor', 'purchase', 'purchase_return', 'purchase_return_item', 'inventory_batch', 'vendor_payment'],
+  vendors_purchases: ['vendor', 'purchase', 'purchase_return', 'purchase_return_item', 'inventory_batch', 'vendor_payment', 'vendor_khata', 'vendor_khata_payment'],
   expenses:          ['expense'],
   employees:         ['employee'],
 };

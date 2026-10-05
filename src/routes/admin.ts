@@ -1347,6 +1347,86 @@ router.get('/instances/:id/loans', async (req: Request, res: Response) => {
   });
 });
 
+// ── Khata (customer + vendor custom bills) ────────────────────────────────────
+router.get('/instances/:id/khata', async (req: Request, res: Response) => {
+  const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
+  if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  const [customerKhata, khataPayments, customers, vendorKhata, vendorKhataPayments, vendors] = await Promise.all([
+    parseEntityFromSync(req.params.id, 'customer_khata'),
+    parseEntityFromSync(req.params.id, 'customer_khata_payment'),
+    parseEntityFromSync(req.params.id, 'customer'),
+    parseEntityFromSync(req.params.id, 'vendor_khata'),
+    parseEntityFromSync(req.params.id, 'vendor_khata_payment'),
+    parseEntityFromSync(req.params.id, 'vendor'),
+  ]);
+
+  const custMap = new Map(customers.map((c: any) => [String(c.id), c.name || '—']));
+  const vendMap = new Map(vendors.map((v: any) => [String(v.id), v.name || '—']));
+
+  const kPaidMap = new Map<string, number>();
+  for (const p of khataPayments) {
+    const kid = String(p.khata_id ?? '');
+    if (!kid) continue;
+    kPaidMap.set(kid, (kPaidMap.get(kid) ?? 0) + toNumber(p.amount));
+  }
+  const vkPaidMap = new Map<string, number>();
+  for (const p of vendorKhataPayments) {
+    const kid = String(p.khata_id ?? '');
+    if (!kid) continue;
+    vkPaidMap.set(kid, (vkPaidMap.get(kid) ?? 0) + toNumber(p.amount));
+  }
+
+  const customerBills = customerKhata.map((k: any) => {
+    const paid = kPaidMap.get(String(k.id)) ?? 0;
+    return { ...k, customer_name: custMap.get(String(k.customer_id)) ?? '—', paid_amount: paid, balance: Math.max(0, toNumber(k.total_amount) - paid) };
+  }).sort((a: any, b: any) => b.balance - a.balance);
+
+  const vendorBills = vendorKhata.map((k: any) => {
+    const paid = vkPaidMap.get(String(k.id)) ?? 0;
+    return { ...k, vendor_name: vendMap.get(String(k.vendor_id)) ?? '—', paid_amount: paid, balance: Math.max(0, toNumber(k.total_amount) - paid) };
+  }).sort((a: any, b: any) => b.balance - a.balance);
+
+  res.json({
+    success: true,
+    data: {
+      customerBills,
+      vendorBills,
+      totalCustomerOwed: Math.round(customerBills.reduce((s: number, k: any) => s + k.balance, 0) * 100) / 100,
+      totalVendorOwed:   Math.round(vendorBills.reduce((s: number, k: any) => s + k.balance, 0) * 100) / 100,
+    },
+  });
+});
+
+// ── Route Book ────────────────────────────────────────────────────────────────
+router.get('/instances/:id/route-book', async (req: Request, res: Response) => {
+  const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
+  if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  const [locations, members, customers] = await Promise.all([
+    parseEntityFromSync(req.params.id, 'customer_location'),
+    parseEntityFromSync(req.params.id, 'customer_location_member'),
+    parseEntityFromSync(req.params.id, 'customer'),
+  ]);
+
+  const custMap = new Map(customers.map((c: any) => [String(c.id), { name: c.name || '—', phone: c.phone || '', outstanding_balance: toNumber(c.outstanding_balance) }]));
+
+  const membersByLoc = new Map<string, any[]>();
+  for (const m of members) {
+    const lid = String(m.location_id);
+    if (!membersByLoc.has(lid)) membersByLoc.set(lid, []);
+    const cust = custMap.get(String(m.customer_id));
+    membersByLoc.get(lid)!.push({ ...m, customer_name: cust?.name ?? '—', phone: cust?.phone ?? '', outstanding_balance: cust?.outstanding_balance ?? 0 });
+  }
+
+  const enriched = locations.map((loc: any) => {
+    const mems = membersByLoc.get(String(loc.id)) ?? [];
+    return { ...loc, members: mems, member_count: mems.length, total_owed: mems.reduce((s: number, m: any) => s + m.outstanding_balance, 0) };
+  });
+
+  res.json({ success: true, data: enriched });
+});
+
 // ── Analytics ─────────────────────────────────────────────────────────────────
 router.get('/analytics', async (req: Request, res: Response) => {
   const { date_from, date_to } = req.query as Record<string, string>;
