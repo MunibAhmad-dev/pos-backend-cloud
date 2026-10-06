@@ -851,6 +851,48 @@ router.post('/instances/:id/unblock-cloud', async (req: Request, res: Response) 
   res.json({ success: true, message: `Cloud sync restored for ${req.params.id}` });
 });
 
+// ── Issue / renew a license (works even when expired or blocked) ──────────────
+// Body: { plan: 'lifetime' | 'monthly' | 'weekly' | 'custom', days?: number }
+// 'lifetime' → null expiry; 'monthly' → 30d; 'weekly' → 7d; 'custom' → days param
+router.post('/instances/:id/issue-license', async (req: Request, res: Response) => {
+  try {
+    const { plan, days: customDays } = req.body as { plan?: string; days?: number };
+    if (!plan) { res.status(400).json({ success: false, error: 'plan is required' }); return; }
+
+    const inst = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
+    if (!inst) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+    const planDaysMap: Record<string, number> = { monthly: 30, weekly: 7, lifetime: 36500 };
+    const durationDays = plan === 'lifetime' ? 36500
+      : plan === 'custom' ? (Number(customDays) || 30)
+      : (planDaysMap[plan] || 30);
+
+    const issuedTo = (inst.store_name || inst.business_name || '').trim() || 'Unknown Business';
+    const generated = generateLicenseKey({ issuedTo, fingerprint: '', plan, durationDays });
+
+    await prisma.licenseKey.create({
+      data: { license_key: generated.licenseKey, instance_id: req.params.id, plan, duration_days: durationDays, expires_at: generated.expiresAt, notes: 'Issued via admin panel' },
+    });
+
+    await prisma.instance.update({
+      where: { instance_id: req.params.id },
+      data: {
+        license_key:     generated.licenseKey,
+        license_plan:    plan,
+        license_expiry:  generated.expiresAt,
+        license_revoked: 0,
+        approval_status: 'approved',
+        block_reason:    '',
+      },
+    });
+
+    res.json({ success: true, license_key: generated.licenseKey, plan, expires_at: generated.expiresAt });
+  } catch (e: any) {
+    console.error('[issue-license]', e.message);
+    res.status(500).json({ success: false, error: e.message || 'Failed to issue license' });
+  }
+});
+
 // ── Legacy: block instance (kept for backward-compat, now behaves like block-cloud) ──
 router.post('/instances/:id/block', async (req: Request, res: Response) => {
   const { reason } = req.body as { reason?: string };
