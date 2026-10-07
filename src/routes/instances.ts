@@ -915,7 +915,7 @@ const CATEGORY_ENTITY_TYPES: Record<string, string[]> = {
   stock_only:        [],
   vendors_purchases: ['vendor', 'purchase', 'purchase_return', 'purchase_return_item', 'inventory_batch', 'vendor_payment', 'vendor_khata', 'vendor_khata_payment'],
   expenses:          ['expense'],
-  employees:         ['employee'],
+  employees:         ['employee', 'employee_advance'],
 };
 
 router.post('/report-deletion', requireInstance as any, async (req: Request, res: Response) => {

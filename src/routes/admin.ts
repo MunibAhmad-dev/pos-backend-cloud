@@ -171,6 +171,7 @@ const ENTITY_TO_TABLE: Record<string, string> = {
   customer:              'customers',
   vendor:                'vendors',
   employee:              'employees',
+  employee_advance:      'employee_advances',
   settings:              'settings',
   // Sales
   sale:                  'sales',
@@ -1042,7 +1043,7 @@ const CATEGORY_ENTITIES: Record<string, string[]> = {
   returns:   ['sale_return', 'sale_return_item', 'purchase_return', 'purchase_return_item'],
   loans:     ['customer_payment', 'vendor_payment'],
   accounts:  ['account', 'account_txn', 'register', 'financial_transaction'],
-  expenses:  ['expense', 'employee'],
+  expenses:  ['expense', 'employee', 'employee_advance'],
   settings:  ['settings'],
 };
 
@@ -1050,7 +1051,7 @@ const CATEGORY_ENTITIES: Record<string, string[]> = {
 const ENTITY_TABLE: Record<string, string> = {
   product: 'products', inventory_batch: 'inventory_batches', stock_adjustment: 'stock_adjustments',
   sale: 'sales', sale_item: 'sale_items',
-  customer: 'customers', vendor: 'vendors', employee: 'employees',
+  customer: 'customers', vendor: 'vendors', employee: 'employees', employee_advance: 'employee_advances',
   purchase: 'purchases', purchase_return: 'purchase_returns', purchase_return_item: 'purchase_return_items',
   sale_return: 'sale_returns', sale_return_item: 'sale_return_items',
   customer_payment: 'customer_payments', vendor_payment: 'vendor_payments',
@@ -1463,20 +1464,39 @@ router.get('/instances/:id/route-book', async (req: Request, res: Response) => {
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
 
-  const [locations, members, customers] = await Promise.all([
+  const [locations, members, customers, customerKhata, khataPayments] = await Promise.all([
     parseEntityFromSync(req.params.id, 'customer_location'),
     parseEntityFromSync(req.params.id, 'customer_location_member'),
     parseEntityFromSync(req.params.id, 'customer'),
+    parseEntityFromSync(req.params.id, 'customer_khata'),
+    parseEntityFromSync(req.params.id, 'customer_khata_payment'),
   ]);
 
   const custMap = new Map(customers.map((c: any) => [String(c.id), { name: c.name || '—', phone: c.phone || '', outstanding_balance: toNumber(c.outstanding_balance) }]));
+
+  // Build per-customer khata balance from sync events
+  const khataPaidMap = new Map<string, number>();
+  for (const p of khataPayments) {
+    const kid = String(p.khata_id ?? '');
+    if (!kid) continue;
+    khataPaidMap.set(kid, (khataPaidMap.get(kid) ?? 0) + toNumber(p.amount));
+  }
+  const khataBalanceByCustomer = new Map<string, number>();
+  for (const k of customerKhata) {
+    if (String(k.status ?? 'open').toLowerCase() === 'closed') continue;
+    const cid = String(k.customer_id ?? '');
+    const paid = khataPaidMap.get(String(k.id)) ?? 0;
+    const bal = Math.max(0, toNumber(k.total_amount) - paid);
+    khataBalanceByCustomer.set(cid, (khataBalanceByCustomer.get(cid) ?? 0) + bal);
+  }
 
   const membersByLoc = new Map<string, any[]>();
   for (const m of members) {
     const lid = String(m.location_id);
     if (!membersByLoc.has(lid)) membersByLoc.set(lid, []);
     const cust = custMap.get(String(m.customer_id));
-    membersByLoc.get(lid)!.push({ ...m, customer_name: cust?.name ?? '—', phone: cust?.phone ?? '', outstanding_balance: cust?.outstanding_balance ?? 0 });
+    const khataBalance = khataBalanceByCustomer.get(String(m.customer_id)) ?? 0;
+    membersByLoc.get(lid)!.push({ ...m, customer_name: cust?.name ?? '—', phone: cust?.phone ?? '', outstanding_balance: (cust?.outstanding_balance ?? 0) + khataBalance });
   }
 
   const enriched = locations.map((loc: any) => {

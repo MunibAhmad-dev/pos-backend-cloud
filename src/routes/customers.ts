@@ -164,4 +164,57 @@ router.get('/khata/summary', requireInstance, async (req: Request, res: Response
   res.json({ success: true, data });
 });
 
+/**
+ * GET /api/customers/locations   [instanceAuth]
+ *
+ * Returns route-book locations with their assigned member customer_ids,
+ * reconstructed from cloud sync events.
+ */
+router.get('/locations', requireInstance, async (req: Request, res: Response) => {
+  const instanceId = req.instance!.instance_id;
+
+  const [locEvents, memberEvents] = await Promise.all([
+    prisma.syncEvent.findMany({
+      where:   { instance_id: instanceId, entity_type: 'customer_location' },
+      orderBy: { id: 'asc' },
+      select:  { operation: true, payload: true },
+    }),
+    prisma.syncEvent.findMany({
+      where:   { instance_id: instanceId, entity_type: 'customer_location_member' },
+      orderBy: { id: 'asc' },
+      select:  { operation: true, payload: true },
+    }),
+  ]);
+
+  const locMap = reconstructFromEvents(locEvents);
+
+  // Build member list per location_id: track upserts/deletes by (location_id, customer_id)
+  const membersByLoc = new Map<string, Map<string, any>>();
+  for (const ev of memberEvents) {
+    let payload: any;
+    try { payload = JSON.parse(ev.payload); } catch { continue; }
+    const locId = String(payload?.location_id ?? '');
+    if (!locId) continue;
+    if (!membersByLoc.has(locId)) membersByLoc.set(locId, new Map());
+    const custId = String(payload?.customer_id ?? '');
+    if (ev.operation === 'delete') {
+      membersByLoc.get(locId)!.delete(custId);
+    } else {
+      membersByLoc.get(locId)!.set(custId, payload);
+    }
+  }
+
+  const data = Array.from(locMap.values()).map(loc => {
+    const locId = String(loc.id);
+    const members = Array.from(membersByLoc.get(locId)?.values() ?? []);
+    return {
+      ...loc,
+      member_count: members.length,
+      members,
+    };
+  });
+
+  res.json({ success: true, data });
+});
+
 export default router;
