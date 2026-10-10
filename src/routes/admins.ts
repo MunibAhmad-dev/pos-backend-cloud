@@ -4,6 +4,7 @@
  */
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
+import { Prisma } from '@prisma/client';
 import prisma from '../db';
 import { requireAdmin } from '../middleware/auth';
 
@@ -35,7 +36,7 @@ export async function logAction(
         action,
         entity:     entity   ?? null,
         entity_id:  entityId ?? null,
-        detail:     detail   ?? null,
+        detail:     detail   ?? Prisma.DbNull,
         ip_address: getIp(req),
       },
     });
