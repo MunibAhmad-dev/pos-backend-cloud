@@ -90,7 +90,15 @@ router.post('/login', async (req: Request, res: Response) => {
   const token     = signAdminToken(payload);
   const expiresIn = process.env.JWT_EXPIRES_IN || '7d';
 
-  res.json({ success: true, token, expiresIn, admin: payload });
+  res.json({
+    success: true,
+    token,
+    expiresIn,
+    admin: {
+      ...payload,
+      permissions: (admin as any).permissions ?? {},
+    },
+  });
 });
 
 /**

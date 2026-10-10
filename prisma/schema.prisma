@@ -373,6 +373,23 @@ model MercyStatusLog {
   @@index([application_id])
 }
 
+model AdminPaymentRecord {
+  id          String   @id @default(cuid())
+  instance_id String
+  store_name  String
+  amount      Float
+  month       String   // "YYYY-MM"
+  date        DateTime
+  notes       String   @default("")
+  recorded_by String   @default("")
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  @@map("admin_payment_records")
+  @@index([month])
+  @@index([instance_id])
+}
+
 model BranchRequest {
   id          Int      @id @default(autoincrement())
   instance_id String
