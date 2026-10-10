@@ -95,11 +95,55 @@ model InstanceSale {
 model AdminUser {
   id            Int      @id @default(autoincrement())
   username      String   @unique
+  display_name  String?
   password_hash String
-  role          String   @default("admin")
+  role          String   @default("admin")   // "super_admin" | "admin"
+  permissions   Json     @default("{}")
+  is_active     Boolean  @default(true)
+  created_by_id Int?
   created_at    DateTime @default(now())
+  last_login_at DateTime?
+
+  created_by     AdminUser?         @relation("AdminCreatedBy", fields: [created_by_id], references: [id], onDelete: SetNull)
+  created_admins AdminUser[]        @relation("AdminCreatedBy")
+  activity_logs  AdminActivityLog[]
+  auth_logs      AdminAuthLog[]
 
   @@map("admin_users")
+}
+
+model AdminActivityLog {
+  id         Int      @id @default(autoincrement())
+  admin_id   Int?
+  admin_name String
+  action     String
+  entity     String?
+  entity_id  String?
+  detail     Json?
+  ip_address String?
+  created_at DateTime @default(now())
+
+  admin AdminUser? @relation(fields: [admin_id], references: [id], onDelete: SetNull)
+
+  @@map("admin_activity_logs")
+  @@index([admin_id])
+  @@index([created_at])
+}
+
+model AdminAuthLog {
+  id         Int      @id @default(autoincrement())
+  username   String
+  success    Boolean
+  ip_address String?
+  user_agent String?
+  reason     String?
+  created_at DateTime @default(now())
+
+  admin AdminUser? @relation(fields: [username], references: [username], onDelete: SetNull)
+
+  @@map("admin_auth_logs")
+  @@index([created_at])
+  @@index([username])
 }
 
 model LicenseKey {

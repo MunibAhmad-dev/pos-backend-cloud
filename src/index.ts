@@ -26,6 +26,7 @@ import authRoutes      from './routes/auth';
 import instanceRoutes  from './routes/instances';
 import syncRoutes      from './routes/sync';
 import adminRoutes     from './routes/admin';
+import adminMgmtRoutes from './routes/admins';
 import businessRoutes  from './routes/businesses';
 import updateRoutes    from './routes/updates';
 import branchRoutes    from './routes/branches';
@@ -142,6 +143,7 @@ app.use('/api/auth',          authLimiter,   authRoutes);
 app.use('/api/instances',     syncLimiter,   instanceRoutes);
 app.use('/api/sync',          syncLimiter,   syncRoutes);
 app.use('/api/admin',         adminLimiter,  adminRoutes);
+app.use('/api/admin/admins',  adminLimiter,  adminMgmtRoutes);
 app.use('/api/updates',       publicLimiter, updateRoutes);
 app.use('/api/branches',      publicLimiter, branchRoutes);
 // APIs for the Manufacturing app (Factory ERP) — see routes/manufacturing/

@@ -50,6 +50,9 @@ router.post('/setup', async (req: Request, res: Response) => {
  */
 router.post('/login', async (req: Request, res: Response) => {
   const { username, password } = req.body as { username?: string; password?: string };
+  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+  const ua = req.headers['user-agent'] || '';
+
   if (!username || !password) {
     res.status(400).json({ success: false, error: 'username and password are required' });
     return;
@@ -60,15 +63,28 @@ router.post('/login', async (req: Request, res: Response) => {
   });
 
   if (!admin) {
+    await prisma.adminAuthLog.create({ data: { username: username.trim().toLowerCase(), success: false, ip_address: ip, user_agent: ua, reason: 'user_not_found' } }).catch(() => {});
     res.status(401).json({ success: false, error: 'Invalid credentials' });
     return;
   }
 
   const valid = await bcrypt.compare(password, admin.password_hash);
   if (!valid) {
+    await prisma.adminAuthLog.create({ data: { username: admin.username, success: false, ip_address: ip, user_agent: ua, reason: 'invalid_password' } }).catch(() => {});
     res.status(401).json({ success: false, error: 'Invalid credentials' });
     return;
   }
+
+  if (!(admin as any).is_active) {
+    await prisma.adminAuthLog.create({ data: { username: admin.username, success: false, ip_address: ip, user_agent: ua, reason: 'account_disabled' } }).catch(() => {});
+    res.status(403).json({ success: false, error: 'This admin account has been disabled' });
+    return;
+  }
+
+  await Promise.all([
+    prisma.adminAuthLog.create({ data: { username: admin.username, success: true, ip_address: ip, user_agent: ua } }).catch(() => {}),
+    prisma.adminUser.update({ where: { id: admin.id }, data: { last_login_at: new Date() } }).catch(() => {}),
+  ]);
 
   const payload   = { id: admin.id, username: admin.username, role: admin.role };
   const token     = signAdminToken(payload);
