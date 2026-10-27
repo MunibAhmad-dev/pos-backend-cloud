@@ -43,6 +43,7 @@ model Instance {
   password_plain     String    @default("")      // plain-text copy — admin support use only
   parent_instance_id String    @default("")      // set on branch instances; "" = top-level/parent
   branch_code        String    @default("")      // BR-XXXXXX used during branch registration
+  active_modules     String    @default("")      // comma-separated list of enabled module keys from heartbeat/register
   created_at         DateTime  @default(now())
   updated_at         DateTime  @updatedAt
 

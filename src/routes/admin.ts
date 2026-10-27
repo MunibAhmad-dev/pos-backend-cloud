@@ -663,6 +663,31 @@ router.get('/instances/:id', async (req: Request, res: Response) => {
     : null;
   const gross_profit_per_day = (gross_profit != null && daysActive) ? Math.round(gross_profit / daysActive) : null;
 
+  // Derive modules: prefer synced settings entity; fall back to active_modules string from heartbeat
+  const settingsEvents = await parseEntityFromSync(req.params.id, 'settings');
+  const syncedSettings: any = settingsEvents[0] ?? null;
+  const MODULE_KEYS_ADMIN = [
+    'dms', 'wholesale', 'pharmacy', 'accounting', 'attendance', 'bakery',
+    'grocery', 'restaurant', 'clothing', 'electronics', 'accessories',
+    'dry_fruits', 'paint', 'mobile', 'laptop', 'urdu', 'product_images',
+  ];
+  let derivedModules: Record<string, boolean> = {};
+  let derivedEnabledModules: string[] = [];
+  if (syncedSettings) {
+    for (const m of MODULE_KEYS_ADMIN) {
+      const key = m === 'product_images' ? 'product_images_enabled' : `${m}_module_enabled`;
+      derivedModules[m] = !!(syncedSettings[key] ?? 0);
+    }
+    derivedEnabledModules = MODULE_KEYS_ADMIN.filter(m => derivedModules[m]);
+  } else {
+    // Fallback: parse from the active_modules string saved by heartbeat/register
+    const rawStr: string = (instance as any).active_modules || '';
+    if (rawStr.trim()) {
+      derivedEnabledModules = rawStr.split(',').map((s: string) => s.trim()).filter(Boolean);
+      for (const m of derivedEnabledModules) derivedModules[m] = true;
+    }
+  }
+
   // Strip password_hash; keep password_plain for admin support viewing
   const { password_hash, password_plain, ...instanceSafe } = instance as any;
 
@@ -673,6 +698,9 @@ router.get('/instances/:id', async (req: Request, res: Response) => {
         ...instanceSafe,
         has_password:     !!(password_hash),
         current_password: password_plain || '',   // plain-text — admin eyes only
+        modules:          derivedModules,
+        enabled_modules:  derivedEnabledModules,
+        active_modules:   derivedEnabledModules.join(', '),
       },
       recentEvents,
       inventoryStats,
@@ -1140,14 +1168,22 @@ router.get('/instances/:id/settings', async (req: Request, res: Response) => {
   const syncedSettings: any = settingsEvents[0] ?? null;
 
   const MODULE_KEYS = [
-    'wholesale', 'pharmacy', 'accounting', 'attendance', 'bakery',
+    'dms', 'wholesale', 'pharmacy', 'accounting', 'attendance', 'bakery',
     'grocery', 'restaurant', 'clothing', 'electronics', 'accessories',
-    'dry_fruits', 'paint', 'mobile', 'laptop', 'urdu',
+    'dry_fruits', 'paint', 'mobile', 'laptop', 'urdu', 'product_images',
   ];
   const modules: Record<string, boolean> = {};
+  // First try synced settings; then fall back to instance.active_modules from heartbeat
   for (const m of MODULE_KEYS) {
-    const key = `${m}_module_enabled`;
+    const key = m === 'product_images' ? 'product_images_enabled' : `${m}_module_enabled`;
     modules[m] = !!(syncedSettings?.[key] ?? 0);
+  }
+  // If no synced settings yet, populate from active_modules heartbeat string
+  if (!syncedSettings) {
+    const rawStr: string = (instance as any).active_modules || '';
+    if (rawStr.trim()) {
+      rawStr.split(',').map((s: string) => s.trim()).filter(Boolean).forEach((m: string) => { modules[m] = true; });
+    }
   }
   const enabledModules = MODULE_KEYS.filter(m => modules[m]);
 
@@ -1167,6 +1203,10 @@ router.get('/instances/:id/settings', async (req: Request, res: Response) => {
       currency:          syncedSettings?.currency        || 'PKR',
       tax_rate:          syncedSettings?.tax_rate        ?? null,
       low_stock_threshold: syncedSettings?.low_stock_threshold ?? null,
+      invoice_style:     syncedSettings?.invoice_style   || null,
+      receipt_size:      syncedSettings?.receipt_size    || null,
+      receipt_printer:   syncedSettings?.receipt_printer || null,
+      label_printer:     syncedSettings?.label_printer   || null,
       // ── License & version ────────────────────────────────────────────────
       branch_name:     instance.branch_name,
       license_plan:    instance.license_plan,

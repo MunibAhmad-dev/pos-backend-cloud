@@ -17,7 +17,18 @@ router.post('/register', async (req: Request, res: Response) => {
   const {
     instance_id, store_name, owner_name, owner_mobile, owner_email,
     store_address, business_name, license_key, fingerprint, app_version, branch_name,
-  } = req.body as Record<string, string>;
+    enabled_modules, active_modules, modules,
+  } = req.body as Record<string, any>;
+
+  // Normalise modules to a comma-separated string
+  let activeModulesStr = '';
+  if (typeof active_modules === 'string' && active_modules.trim()) {
+    activeModulesStr = active_modules.trim();
+  } else if (Array.isArray(enabled_modules) && enabled_modules.length) {
+    activeModulesStr = enabled_modules.filter(Boolean).join(', ');
+  } else if (modules && typeof modules === 'object') {
+    activeModulesStr = Object.entries(modules).filter(([, v]) => v === true || v === 1).map(([k]) => k).join(', ');
+  }
 
   if (!instance_id || !owner_mobile) {
     res.status(400).json({ success: false, error: 'instance_id and owner_mobile are required' });
@@ -40,7 +51,8 @@ router.post('/register', async (req: Request, res: Response) => {
         app_version:        app_version   || undefined,
         branch_name:        branch_name   || undefined,
         last_seen:          new Date(),
-      },
+        ...(activeModulesStr ? { active_modules: activeModulesStr } : {}),
+      } as any,
     });
 
     return res.json({
@@ -74,7 +86,8 @@ router.post('/register', async (req: Request, res: Response) => {
         app_version:        app_version   || undefined,
         branch_name:        branch_name   || undefined,
         last_seen:          new Date(),
-      },
+        ...(activeModulesStr ? { active_modules: activeModulesStr } : {}),
+      } as any,
     });
     return res.json({
       success:         true,
@@ -124,7 +137,8 @@ router.post('/register', async (req: Request, res: Response) => {
       app_version:        app_version   || '',
       branch_name:        branch_name   || 'Main Branch',
       approval_status:    'pending',
-    },
+      active_modules:     activeModulesStr,
+    } as any,
   });
 
   res.status(201).json({
@@ -210,7 +224,17 @@ router.post('/complete-db-upload', requireInstance, async (req: Request, res: Re
  */
 router.post('/heartbeat', requireInstance, async (req: Request, res: Response) => {
   const inst = req.instance!;
-  const { store_name, total_sales, total_revenue, total_customers, total_products, operating_mode, app_version } = req.body as Record<string, any>;
+  const { store_name, total_sales, total_revenue, total_customers, total_products, operating_mode, app_version, enabled_modules, active_modules, modules } = req.body as Record<string, any>;
+
+  // Build active_modules string from whichever format the POS sent
+  let activeModulesStr: string | undefined;
+  if (typeof active_modules === 'string' && active_modules.trim()) {
+    activeModulesStr = active_modules.trim();
+  } else if (Array.isArray(enabled_modules) && enabled_modules.length) {
+    activeModulesStr = enabled_modules.filter(Boolean).join(', ');
+  } else if (modules && typeof modules === 'object') {
+    activeModulesStr = Object.entries(modules).filter(([, v]) => v === true || v === 1).map(([k]) => k).join(', ');
+  }
 
   await prisma.instance.update({
     where: { instance_id: inst.instance_id },
@@ -223,8 +247,9 @@ router.post('/heartbeat', requireInstance, async (req: Request, res: Response) =
       total_products:  total_products  != null ? Number(total_products)  : undefined,
       operating_mode:  operating_mode === 'sales' ? 'sales' : operating_mode === 'full' ? 'full' : undefined,
       app_version:     app_version   || undefined,
+      ...(activeModulesStr !== undefined ? { active_modules: activeModulesStr } : {}),
     },
-  });
+  } as any);
 
   const updated = await prisma.instance.findUnique({
     where:  { instance_id: inst.instance_id },
