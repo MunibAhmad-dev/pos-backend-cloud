@@ -202,6 +202,21 @@ const ENTITY_TO_TABLE: Record<string, string> = {
   financial_transaction: 'financial_transactions',
   // History
   entity_history:        'entity_history',
+  // Khata (credit ledger)
+  customer_khata:         'customer_khatas',
+  customer_khata_payment: 'customer_khata_payments',
+  vendor_khata:           'vendor_khatas',
+  vendor_khata_payment:   'vendor_khata_payments',
+  // Route book
+  customer_location:        'customer_locations',
+  customer_location_member: 'customer_location_members',
+  // DMS
+  dms_company:         'dms_companies',
+  dms_order:           'dms_orders',
+  dms_partner_drawing: 'dms_partner_drawings',
+  dms_recovery:        'dms_recoveries',
+  // Agreement
+  agreement:           'agreements',
 };
 
 async function buildExportPayload(instanceId: string) {
@@ -1513,6 +1528,18 @@ router.get('/instances/:id/route-book', async (req: Request, res: Response) => {
   });
 
   res.json({ success: true, data: enriched });
+});
+
+// ── Agreement ─────────────────────────────────────────────────────────────────
+router.get('/instances/:id/agreement', async (req: Request, res: Response) => {
+  const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
+  if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  const agreements = await parseEntityFromSync(req.params.id, 'agreement');
+  const latest = agreements
+    .sort((a: any, b: any) => new Date(b.signed_at || b.created_at || 0).getTime() - new Date(a.signed_at || a.created_at || 0).getTime())[0] ?? null;
+
+  res.json({ success: true, data: latest });
 });
 
 // ── Analytics ─────────────────────────────────────────────────────────────────
