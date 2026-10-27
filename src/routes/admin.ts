@@ -121,22 +121,29 @@ function getFirstNumber(source: Record<string, any>, keys: string[]): number {
   return 0;
 }
 
+// Cap per-unit price/cost at 5 M PKR — mirrors the POS's MIN(price,5000000) DB guard.
+// Without this, a single corrupted sync payload with a huge number inflates the
+// whole stockValue/retailValue sum past the frontend's 1 B sanity limit → "Data error".
+const MAX_UNIT_PKR = 5_000_000;
+
 // Weight-based products (unit_type='gram'/'kg') store stock in their native unit.
 // purchase_price and price_per_kg are always per-kg in the POS.
 // Normalize so calculations are always in kg-equivalent units.
 function normalizeProductStock(product: Record<string, any>): { stock: number; cost: number; salePrice: number } {
   const rawStock = Math.max(0, getFirstNumber(product, ['stock', 'quantity', 'qty', 'current_stock', 'stock_quantity', 'available_stock']));
-  const cost     = getFirstNumber(product, ['purchase_price', 'cost_price', 'buying_price', 'wholesale_price', 'unit_cost', 'cost']);
+  const rawCost  = getFirstNumber(product, ['purchase_price', 'cost_price', 'buying_price', 'wholesale_price', 'unit_cost', 'cost']);
+  const cost     = Math.min(rawCost, MAX_UNIT_PKR);
   const unitType = String(product.unit_type || '').toLowerCase();
   const isGram   = unitType === 'gram';
   const isWeight = isGram || unitType === 'kg';
   // gram products: stock is in grams, convert to kg for value calculations
   const stock    = isGram ? rawStock / 1000 : rawStock;
   // weight products use price_per_kg as the retail price; regular products use price
-  const pricePerKg = toNumber(product.price_per_kg);
-  const salePrice  = isWeight && pricePerKg > 0
+  const pricePerKg  = Math.min(toNumber(product.price_per_kg), MAX_UNIT_PKR);
+  const rawSalePrice = isWeight && pricePerKg > 0
     ? pricePerKg
     : getFirstNumber(product, ['price', 'sale_price', 'selling_price', 'retail_price']);
+  const salePrice = Math.min(rawSalePrice, MAX_UNIT_PKR);
   return { stock, cost, salePrice };
 }
 
@@ -624,9 +631,10 @@ router.get('/instances/:id', async (req: Request, res: Response) => {
     try {
       const item = JSON.parse(ev.payload);
       const qty  = Math.max(0, getFirstNumber(item, ['qty','quantity','item_qty']));
-      const cost = getFirstNumber(item, ['purchase_price','cost_price','buying_price','unit_cost','cost'])
-                || productCostMap.get(String(item.product_id ?? item.productId ?? ''))
-                || 0;
+      const rawCost = getFirstNumber(item, ['purchase_price','cost_price','buying_price','unit_cost','cost'])
+                   || productCostMap.get(String(item.product_id ?? item.productId ?? ''))
+                   || 0;
+      const cost = Math.min(rawCost, MAX_UNIT_PKR);
       if (cost > 0) { totalCOGS += qty * cost; itemsWithCost++; }
     } catch { /* skip malformed payload */ }
   }
