@@ -1058,6 +1058,18 @@ router.get('/pull-data', requireInstance as any, async (req: Request, res: Respo
   }
 
   const total = Object.values(result).reduce((s, arr) => s + arr.length, 0);
+
+  // Deliver the resync flag then clear it atomically so the device acts on it
+  // exactly once — no user interaction needed. The POS will trigger full-resync
+  // + push on this same pull cycle.
+  const needsResync = !!(instance as any).needs_resync;
+  if (needsResync) {
+    await prisma.instance.update({
+      where: { instance_id: instance.instance_id },
+      data:  { needs_resync: false },
+    });
+  }
+
   res.json({
     success:       true,
     data:          result,
@@ -1066,6 +1078,7 @@ router.get('/pull-data', requireInstance as any, async (req: Request, res: Respo
     total_records: total,
     hasMore,
     lastId,
+    needs_resync:  needsResync,
   });
 });
 

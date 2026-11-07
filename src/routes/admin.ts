@@ -217,6 +217,8 @@ const ENTITY_TO_TABLE: Record<string, string> = {
   dms_recovery:        'dms_recoveries',
   // Agreement
   agreement:           'agreements',
+  // POS Users
+  pos_user:            'pos_users',
 };
 
 async function buildExportPayload(instanceId: string) {
@@ -903,6 +905,20 @@ router.post('/instances/:id/unblock-cloud', async (req: Request, res: Response) 
   res.json({ success: true, message: `Cloud sync restored for ${req.params.id}` });
 });
 
+// ── Request full resync from a POS instance ──────────────────────────────────
+// Sets needs_resync = true. The POS sees this flag on its next pull-data call,
+// automatically triggers full-resync + push without any user interaction needed.
+// The flag is cleared by pull-data after it is delivered.
+router.post('/instances/:id/request-resync', async (req: Request, res: Response) => {
+  const inst = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
+  if (!inst) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+  await prisma.instance.update({
+    where: { instance_id: req.params.id },
+    data:  { needs_resync: true },
+  });
+  res.json({ success: true, message: `Full resync requested for ${req.params.id}. Device will re-push all data on its next sync cycle.` });
+});
+
 // ── Issue / renew a license (works even when expired or blocked) ──────────────
 // Body: { plan: 'lifetime' | 'monthly' | 'weekly' | 'custom', days?: number }
 // 'lifetime' → null expiry; 'monthly' → 30d; 'weekly' → 7d; 'custom' → days param
@@ -1580,6 +1596,39 @@ router.get('/instances/:id/agreement', async (req: Request, res: Response) => {
     .sort((a: any, b: any) => new Date(b.signed_at || b.created_at || 0).getTime() - new Date(a.signed_at || a.created_at || 0).getTime())[0] ?? null;
 
   res.json({ success: true, data: latest });
+});
+
+// ── POS Users ─────────────────────────────────────────────────────────────────
+const _USER_ENC_KEY = crypto.createHash('sha256').update('OsaTechPOS_UserKey_2024!@#Munib').digest();
+function decryptUserPassword(enc: string): string {
+  try {
+    const [ivH, dataH] = enc.split(':');
+    const d = crypto.createDecipheriv('aes-256-cbc', _USER_ENC_KEY, Buffer.from(ivH, 'hex'));
+    return Buffer.concat([d.update(Buffer.from(dataH, 'hex')), d.final()]).toString('utf8');
+  } catch { return '(unreadable)'; }
+}
+
+router.get('/instances/:id/users', async (req: Request, res: Response) => {
+  const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
+  if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  const raw = await parseEntityFromSync(req.params.id, 'pos_user');
+  // Keep only the latest record per user id (upsert semantics)
+  const byId = new Map<number, any>();
+  for (const u of raw.sort((a: any, b: any) => new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime())) {
+    byId.set(u.id, u);
+  }
+  const users = [...byId.values()].map((u: any) => ({
+    id:         u.id,
+    full_name:  u.full_name,
+    username:   u.username,
+    role:       u.role,
+    is_active:  u.is_active,
+    created_at: u.created_at,
+    password:   u.password_enc ? decryptUserPassword(u.password_enc) : '—',
+  }));
+
+  res.json({ success: true, data: users });
 });
 
 // ── Analytics ─────────────────────────────────────────────────────────────────
