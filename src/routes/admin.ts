@@ -919,6 +919,62 @@ router.post('/instances/:id/request-resync', async (req: Request, res: Response)
   res.json({ success: true, message: `Full resync requested for ${req.params.id}. Device will re-push all data on its next sync cycle.` });
 });
 
+// ── Data health check: count sales with missing GP data ───────────────────────
+router.get('/instances/:id/data-health', async (req: Request, res: Response) => {
+  const inst = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
+  if (!inst) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  const sales     = await parseEntityFromSync(req.params.id, 'sale');
+  const saleItems = await parseEntityFromSync(req.params.id, 'sale_item');
+
+  const totalSales   = sales.filter((s: any) => s.status !== 'Cancelled' && s.status !== 'cancelled').length;
+  const itemsByTxn   = new Map<string, any[]>();
+  for (const item of saleItems) {
+    const sid = String(item.sale_id ?? '');
+    if (!itemsByTxn.has(sid)) itemsByTxn.set(sid, []);
+    itemsByTxn.get(sid)!.push(item);
+  }
+
+  let missingCostCount  = 0;
+  let zeroItemsCount    = 0;
+  for (const s of sales) {
+    if (s.status === 'Cancelled' || s.status === 'cancelled') continue;
+    const items = itemsByTxn.get(String(s.id ?? '')) ?? [];
+    if (items.length === 0) { zeroItemsCount++; continue; }
+    const hasNoCost = items.every((it: any) => {
+      const cost = parseFloat(it.cost_price ?? it.cost ?? '0');
+      return !cost || cost === 0;
+    });
+    if (hasNoCost) missingCostCount++;
+  }
+
+  const healthPct = totalSales > 0 ? Math.round(((totalSales - missingCostCount) / totalSales) * 100) : 100;
+  res.json({
+    success: true,
+    data: {
+      total_sales:       totalSales,
+      missing_cost:      missingCostCount,
+      zero_item_sales:   zeroItemsCount,
+      health_pct:        healthPct,
+      needs_repair:      missingCostCount > 0,
+    },
+  });
+});
+
+// ── Request GP repair from a POS instance ────────────────────────────────────
+// Triggers needs_resync so the POS re-pushes after the operator runs repair manually.
+// The POS operator must go to Settings → Repair GP Data first, then this resync
+// will push the corrected cost data to the cloud.
+router.post('/instances/:id/request-gp-repair', async (req: Request, res: Response) => {
+  const inst = await prisma.instance.findUnique({ where: { instance_id: req.params.id } });
+  if (!inst) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+  await prisma.instance.update({
+    where: { instance_id: req.params.id },
+    data:  { needs_resync: true },
+  });
+  res.json({ success: true, message: 'Full resync requested. Ask the shop operator to run Settings → Repair GP Data on the POS, then sync.' });
+});
+
 // ── Issue / renew a license (works even when expired or blocked) ──────────────
 // Body: { plan: 'lifetime' | 'monthly' | 'weekly' | 'custom', days?: number }
 // 'lifetime' → null expiry; 'monthly' → 30d; 'weekly' → 7d; 'custom' → days param
@@ -1237,70 +1293,67 @@ router.get('/instances/:id/settings', async (req: Request, res: Response) => {
   });
 });
 
+// ── Pagination helper ─────────────────────────────────────────────────────────
+function paginate(arr: any[], page: number, limit: number) {
+  const total  = arr.length;
+  const pages  = Math.ceil(total / limit);
+  const offset = (page - 1) * limit;
+  return { data: arr.slice(offset, offset + limit), total, page, limit, pages };
+}
+function parsePage(q: Record<string, string>) {
+  const limit = Math.min(500, Math.max(1, parseInt(q.limit ?? '') || 100));
+  const page  = Math.max(1, parseInt(q.page  ?? '') || 1);
+  return { limit, page };
+}
+
 // ── Products / customers / vendors / purchases / expenses / loans ──────────────
 router.get('/instances/:id/products', async (req: Request, res: Response) => {
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
-  const products = (await parseEntityFromSync(req.params.id, 'product'))
+  const { limit, page } = parsePage(req.query as Record<string, string>);
+  const all = (await parseEntityFromSync(req.params.id, 'product'))
     .map((product) => {
       const { stock, cost, salePrice } = normalizeProductStock(product);
-      return {
-        ...product,
-        stock_value:        Math.round(stock * cost      * 100) / 100,
-        retail_stock_value: Math.round(stock * salePrice * 100) / 100,
-      };
+      return { ...product, stock_value: Math.round(stock * cost * 100) / 100, retail_stock_value: Math.round(stock * salePrice * 100) / 100 };
     })
     .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-  res.json({ success: true, data: products, total: products.length });
+  res.json({ success: true, ...paginate(all, page, limit) });
 });
 
 router.get('/instances/:id/customers', async (req: Request, res: Response) => {
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+  const { limit, page } = parsePage(req.query as Record<string, string>);
 
-  const [customers, sales, payments] = await Promise.all([
-    parseEntityFromSync(req.params.id, 'customer'),
-    parseEntityFromSync(req.params.id, 'sale'),
-    parseEntityFromSync(req.params.id, 'customer_payment'),
-  ]);
+  // Only need customer entities — balance comes from stored outstanding_balance (maintained by POS with full history)
+  const customers = await parseEntityFromSync(req.params.id, 'customer');
 
-  const salesMap = new Map<string, number>();
-  for (const s of sales) {
-    const cid = String(s.customer_id ?? '');
-    if (!cid || cid === 'null' || cid === '0') continue;
-    if (s.status === 'Cancelled' || s.status === 'cancelled') continue;
-    salesMap.set(cid, (salesMap.get(cid) ?? 0) + (parseFloat(s.total) || 0));
-  }
-  const payMap = new Map<string, number>();
-  for (const p of payments) {
-    const cid = String(p.customer_id ?? '');
-    if (!cid || cid === 'null') continue;
-    payMap.set(cid, (payMap.get(cid) ?? 0) + (parseFloat(p.amount) || 0));
-  }
+  const items = customers
+    .map((c: any) => ({ ...c, balance: Math.max(0, parseFloat(c.outstanding_balance) || 0) }))
+    .sort((a: any, b: any) => (b.balance - a.balance) || (a.name || '').localeCompare(b.name || ''));
 
-  const items = customers.map((c: any) => {
-    const cid = String(c.id ?? '');
-    return { ...c, balance: Math.round(Math.max(0, (salesMap.get(cid) ?? 0) - (payMap.get(cid) ?? 0)) * 100) / 100 };
-  }).sort((a: any, b: any) => (b.balance - a.balance) || (a.name || '').localeCompare(b.name || ''));
-
-  res.json({ success: true, data: items, total: items.length });
+  res.json({ success: true, ...paginate(items, page, limit) });
 });
 
 router.get('/instances/:id/vendors', async (req: Request, res: Response) => {
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+  const { limit, page } = parsePage(req.query as Record<string, string>);
 
-  const [vendors, purchases, payments] = await Promise.all([
+  const [vendors, purchases, payments, purchaseReturns] = await Promise.all([
     parseEntityFromSync(req.params.id, 'vendor'),
     parseEntityFromSync(req.params.id, 'purchase'),
     parseEntityFromSync(req.params.id, 'vendor_payment'),
+    parseEntityFromSync(req.params.id, 'purchase_return'),
   ]);
 
   const purchMap = new Map<string, number>();
+  const purchIdToVendor = new Map<string, string>();
   for (const p of purchases) {
     const vid = String(p.vendor_id ?? '');
     if (!vid || vid === 'null' || vid === '0') continue;
     purchMap.set(vid, (purchMap.get(vid) ?? 0) + (parseFloat(p.total) || 0));
+    purchIdToVendor.set(String(p.id ?? ''), vid);
   }
   const payMap = new Map<string, number>();
   for (const p of payments) {
@@ -1308,13 +1361,21 @@ router.get('/instances/:id/vendors', async (req: Request, res: Response) => {
     if (!vid || vid === 'null') continue;
     payMap.set(vid, (payMap.get(vid) ?? 0) + (parseFloat(p.amount) || 0));
   }
+  // Subtract purchase returns from vendor owed totals
+  const retMap = new Map<string, number>();
+  for (const r of purchaseReturns) {
+    const vid = r.vendor_id ? String(r.vendor_id) : (purchIdToVendor.get(String(r.purchase_id ?? '')) ?? '');
+    if (!vid || vid === 'null' || vid === '0') continue;
+    retMap.set(vid, (retMap.get(vid) ?? 0) + (parseFloat(r.total_returned ?? r.total ?? r.amount ?? '0') || 0));
+  }
 
   const items = vendors.map((v: any) => {
     const vid = String(v.id ?? '');
-    return { ...v, balance: Math.round(Math.max(0, (purchMap.get(vid) ?? 0) - (payMap.get(vid) ?? 0)) * 100) / 100 };
+    const balance = Math.max(0, (purchMap.get(vid) ?? 0) - (payMap.get(vid) ?? 0) - (retMap.get(vid) ?? 0));
+    return { ...v, balance: Math.round(balance * 100) / 100 };
   }).sort((a: any, b: any) => (b.balance - a.balance) || (a.name || '').localeCompare(b.name || ''));
 
-  res.json({ success: true, data: items, total: items.length });
+  res.json({ success: true, ...paginate(items, page, limit) });
 });
 
 // ── Period Stats (revenue + gross profit for a date range) ───────────────────
@@ -1322,7 +1383,7 @@ router.get('/instances/:id/period-stats', async (req: Request, res: Response) =>
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
 
-  const { from, to } = req.query as { from?: string; to?: string };
+  const { from, to, local_today } = req.query as { from?: string; to?: string; local_today?: string };
 
   // Compute previous period date range (same duration, shifted back)
   let prevFrom: string | undefined;
@@ -1335,16 +1396,20 @@ router.get('/instances/:id/period-stats', async (req: Request, res: Response) =>
     prevFrom = new Date(msFrom - dur).toISOString().slice(0, 10);
   }
 
-  // Always compute today (server date — matches POS localtime for same-TZ deployments)
-  const todayStr = new Date().toISOString().slice(0, 10);
-  const ystStr   = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  // Use client-supplied local date so "today" matches POS localtime (UTC+5 for Pakistan)
+  const todayStr = local_today || new Date().toISOString().slice(0, 10);
+  const todayMs  = new Date(todayStr).getTime();
+  const ystStr   = new Date(todayMs - 86400000).toISOString().slice(0, 10);
 
-  const [sales, saleItems, custPayments, purchases, expenses] = await Promise.all([
+  const [sales, saleItems, custPayments, purchases, expenses, saleReturns, saleReturnItems, purchaseReturns] = await Promise.all([
     parseEntityFromSync(req.params.id, 'sale'),
     parseEntityFromSync(req.params.id, 'sale_item'),
     parseEntityFromSync(req.params.id, 'customer_payment'),
     parseEntityFromSync(req.params.id, 'purchase'),
     parseEntityFromSync(req.params.id, 'expense'),
+    parseEntityFromSync(req.params.id, 'sale_return'),
+    parseEntityFromSync(req.params.id, 'sale_return_item'),
+    parseEntityFromSync(req.params.id, 'purchase_return'),
   ]);
 
   const dateOf = (e: any): string | null =>
@@ -1357,44 +1422,89 @@ router.get('/instances/:id/period-stats', async (req: Request, res: Response) =>
     return true;
   };
 
-  // Current period
+  // Maps for joining return items → costs
+  const saleItemCostMap = new Map<string, number>();
+  for (const si of saleItems) {
+    const pp = parseFloat(si.purchase_price) || 0;
+    if (pp > 0) saleItemCostMap.set(String(si.id ?? ''), pp);
+  }
+  const retItemsByReturn = new Map<string, any[]>();
+  for (const ri of saleReturnItems) {
+    const rid = String(ri.return_id ?? '');
+    if (!retItemsByReturn.has(rid)) retItemsByReturn.set(rid, []);
+    retItemsByReturn.get(rid)!.push(ri);
+  }
+
+  // Helper: sum revenue & COGS deducted by a list of sale returns
+  const calcReturnImpact = (rets: any[]): { revenue: number; cogs: number } => {
+    let rev = 0, cg = 0;
+    for (const r of rets) {
+      rev += parseFloat(r.total_returned) || 0;
+      const items = retItemsByReturn.get(String(r.id ?? '')) ?? [];
+      for (const ri of items) {
+        const cost = saleItemCostMap.get(String(ri.sale_item_id ?? '')) ?? 0;
+        cg += cost * (parseFloat(ri.quantity) || 0);
+      }
+    }
+    return { revenue: rev, cogs: cg };
+  };
+
+  // Current period sales (excludes Cancelled)
   const filtSales = sales.filter((s: any) => inRange(dateOf(s), from, to) && s.status !== 'Cancelled' && s.status !== 'cancelled');
   const filtSaleIds = new Set(filtSales.map((s: any) => String(s.id)));
   const filtItems = saleItems.filter((si: any) => filtSaleIds.has(String(si.sale_id)));
 
-  const revenue = filtSales.reduce((s: number, x: any) => s + (parseFloat(x.total) || 0), 0);
-  const cogs    = filtItems.reduce((s: number, si: any) => {
+  // Sale returns that occurred in this period (net from revenue regardless of original sale date)
+  const filtSaleReturns = saleReturns.filter((r: any) => inRange(dateOf(r), from, to));
+  const retImpact = calcReturnImpact(filtSaleReturns);
+
+  const grossRevenue = filtSales.reduce((s: number, x: any) => s + (parseFloat(x.total) || 0), 0);
+  const revenue      = grossRevenue - retImpact.revenue;   // net of returns
+  const rawCogs      = filtItems.reduce((s: number, si: any) => {
     const pp = parseFloat(si.purchase_price) || 0;
     return pp > 0 ? s + pp * (parseFloat(si.quantity) || 0) : s;
   }, 0);
+  const cogs  = rawCogs - retImpact.cogs;                  // net of returned COGS
   const hasGP = filtItems.some((si: any) => parseFloat(si.purchase_price) > 0);
   const gp    = hasGP ? revenue - cogs : null;
 
   const cashCollected   = custPayments.filter((p: any) => inRange(dateOf(p), from, to)).reduce((s: number, p: any) => s + (parseFloat(p.amount) || 0), 0);
-  const periodPurchases = purchases.filter((p: any) => inRange(dateOf(p), from, to)).reduce((s: number, p: any) => s + (parseFloat(p.total) || 0), 0);
+
+  // Purchase returns in period reduce period purchases
+  const filtPurchReturns   = purchaseReturns.filter((r: any) => inRange(dateOf(r), from, to));
+  const returnedPurchaseAmt = filtPurchReturns.reduce((s: number, r: any) => s + (parseFloat(r.total_returned) || 0), 0);
+  const periodPurchases = purchases.filter((p: any) => inRange(dateOf(p), from, to)).reduce((s: number, p: any) => s + (parseFloat(p.total) || 0), 0) - returnedPurchaseAmt;
   const periodExpenses  = expenses.filter((e: any) => inRange(dateOf(e), from, to)).reduce((s: number, e: any) => s + (parseFloat(e.amount) || 0), 0);
 
   // Previous period (for % change)
   const prevSales = prevFrom ? sales.filter((s: any) => inRange(dateOf(s), prevFrom, prevTo) && s.status !== 'Cancelled' && s.status !== 'cancelled') : [];
-  const prevRevenue      = prevSales.reduce((s: number, x: any) => s + (parseFloat(x.total) || 0), 0);
+  const prevGrossRevenue = prevSales.reduce((s: number, x: any) => s + (parseFloat(x.total) || 0), 0);
   const prevTransactions = prevSales.length;
   const prevSaleIds      = new Set(prevSales.map((s: any) => String(s.id)));
   const prevItems        = saleItems.filter((si: any) => prevSaleIds.has(String(si.sale_id)));
-  const prevCogs         = prevItems.reduce((s: number, si: any) => {
+  const prevSaleReturns  = prevFrom ? saleReturns.filter((r: any) => inRange(dateOf(r), prevFrom, prevTo)) : [];
+  const prevRetImpact    = calcReturnImpact(prevSaleReturns);
+  const prevRevenue      = prevGrossRevenue - prevRetImpact.revenue;
+  const prevRawCogs      = prevItems.reduce((s: number, si: any) => {
     const pp = parseFloat(si.purchase_price) || 0;
     return pp > 0 ? s + pp * (parseFloat(si.quantity) || 0) : s;
   }, 0);
+  const prevCogs   = prevRawCogs - prevRetImpact.cogs;
   const prevHasGP  = prevItems.some((si: any) => parseFloat(si.purchase_price) > 0);
   const prevGP     = prevHasGP ? prevRevenue - prevCogs : null;
 
   const pct = (cur: number, prev: number): number | null =>
     prev > 0 ? Math.round((cur - prev) / prev * 1000) / 10 : null;
 
-  // Today vs yesterday
-  const todaySales = sales.filter((s: any) => dateOf(s) === todayStr && s.status !== 'Cancelled' && s.status !== 'cancelled');
-  const ystSales   = sales.filter((s: any) => dateOf(s) === ystStr   && s.status !== 'Cancelled' && s.status !== 'cancelled');
-  const todayRevenue = todaySales.reduce((s: number, x: any) => s + (parseFloat(x.total) || 0), 0);
-  const ystRevenue   = ystSales.reduce((s: number, x: any) => s + (parseFloat(x.total) || 0), 0);
+  // Today vs yesterday (net of same-day returns)
+  const todaySales   = sales.filter((s: any) => dateOf(s) === todayStr && s.status !== 'Cancelled' && s.status !== 'cancelled');
+  const ystSales     = sales.filter((s: any) => dateOf(s) === ystStr   && s.status !== 'Cancelled' && s.status !== 'cancelled');
+  const todayReturns = saleReturns.filter((r: any) => dateOf(r) === todayStr);
+  const ystReturns   = saleReturns.filter((r: any) => dateOf(r) === ystStr);
+  const todayRetAmt  = todayReturns.reduce((s: number, r: any) => s + (parseFloat(r.total_returned) || 0), 0);
+  const ystRetAmt    = ystReturns.reduce((s: number, r: any) => s + (parseFloat(r.total_returned) || 0), 0);
+  const todayRevenue = todaySales.reduce((s: number, x: any) => s + (parseFloat(x.total) || 0), 0) - todayRetAmt;
+  const ystRevenue   = ystSales.reduce((s: number, x: any) => s + (parseFloat(x.total) || 0), 0) - ystRetAmt;
 
   const rnd = (v: number) => Math.round(v * 100) / 100;
 
@@ -1627,33 +1737,30 @@ router.get('/instances/:id/vendors/:vid/ledger', async (req: Request, res: Respo
 router.get('/instances/:id/purchases', async (req: Request, res: Response) => {
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+  const { limit, page } = parsePage(req.query as Record<string, string>);
 
   const [purchases, vendors] = await Promise.all([
     parseEntityFromSync(req.params.id, 'purchase'),
     parseEntityFromSync(req.params.id, 'vendor'),
   ]);
 
-  // Build vendor lookup: id → name
-  const vendorById = new Map<string, string>(
-    vendors.map((v: any) => [String(v.id ?? ''), v.name || '—'])
-  );
+  const vendorById = new Map<string, string>(vendors.map((v: any) => [String(v.id ?? ''), v.name || '—']));
 
-  const enriched = purchases
+  const all = purchases
     .map((p: any) => ({
       ...p,
-      // Normalise date: POS uses date_created, UI column expects 'date'
       date:        p.date_created || p.date_added || p.date || null,
-      // Resolve vendor name from separate vendor sync events
       vendor_name: vendorById.get(String(p.vendor_id ?? '')) || p.vendor_name || '—',
     }))
     .sort((a: any, b: any) => (b.date || '').localeCompare(a.date || ''));
 
-  res.json({ success: true, data: enriched, total: enriched.length });
+  res.json({ success: true, ...paginate(all, page, limit) });
 });
 
 router.get('/instances/:id/expenses', async (req: Request, res: Response) => {
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+  const { limit, page } = parsePage(req.query as Record<string, string>);
 
   const [expenses, employees] = await Promise.all([
     parseEntityFromSync(req.params.id, 'expense'),
@@ -1668,14 +1775,14 @@ router.get('/instances/:id/expenses', async (req: Request, res: Response) => {
     .map((e: any) => ({ ...e, _type: 'employee' }))
     .sort((a: any, b: any) => (a.name || '').localeCompare(b.name || ''));
 
-  res.json({ success: true, data: expenseRows, employees: employeeRows,
-             total: expenseRows.length, totalEmployees: employeeRows.length });
+  res.json({ success: true, ...paginate(expenseRows, page, limit), employees: employeeRows, totalEmployees: employeeRows.length });
 });
 
 // ── Returns (sale returns + purchase returns) ─────────────────────────────────
 router.get('/instances/:id/returns', async (req: Request, res: Response) => {
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+  const { limit, page } = parsePage(req.query as Record<string, string>);
   const [saleReturns, purchaseReturns, customers, vendors, sales, purchases] = await Promise.all([
     parseEntityFromSync(req.params.id, 'sale_return'),
     parseEntityFromSync(req.params.id, 'purchase_return'),
@@ -1707,41 +1814,44 @@ router.get('/instances/:id/returns', async (req: Request, res: Response) => {
       date: r.date_created || r.date_added || r.date,
     };
   }).sort((a: any, b: any) => (b.date || '').localeCompare(a.date || ''));
-  res.json({ success: true, sale_returns: sr, purchase_returns: pr });
+  const allReturns = [...sr, ...pr].sort((a: any, b: any) => (b.date || '').localeCompare(a.date || ''));
+  res.json({ success: true, sale_returns: sr, purchase_returns: pr, ...paginate(allReturns, page, limit) });
 });
 
 // ── Stock Adjustments ─────────────────────────────────────────────────────────
 router.get('/instances/:id/stock-adjustments', async (req: Request, res: Response) => {
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+  const { limit, page } = parsePage(req.query as Record<string, string>);
   const [adjustments, products] = await Promise.all([
     parseEntityFromSync(req.params.id, 'stock_adjustment'),
     parseEntityFromSync(req.params.id, 'product'),
   ]);
   const prodMap = new Map(products.map((p: any) => [String(p.id), p.name || '—']));
-  const rows = adjustments.map((a: any) => ({
+  const all = adjustments.map((a: any) => ({
     ...a,
     product_name: prodMap.get(String(a.product_id ?? '')) || a.product_name || '—',
     date: a.date_created || a.date_added || a.date,
   })).sort((a: any, b: any) => (b.date || '').localeCompare(a.date || ''));
-  res.json({ success: true, data: rows, total: rows.length });
+  res.json({ success: true, ...paginate(all, page, limit) });
 });
 
 // ── Employee Advances ─────────────────────────────────────────────────────────
 router.get('/instances/:id/employee-advances', async (req: Request, res: Response) => {
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+  const { limit, page } = parsePage(req.query as Record<string, string>);
   const [advances, employees] = await Promise.all([
     parseEntityFromSync(req.params.id, 'employee_advance'),
     parseEntityFromSync(req.params.id, 'employee'),
   ]);
   const empMap = new Map(employees.map((e: any) => [String(e.id), e.name || '—']));
-  const rows = advances.map((a: any) => ({
+  const all = advances.map((a: any) => ({
     ...a,
     employee_name: empMap.get(String(a.employee_id ?? '')) || a.employee_name || '—',
     date: a.date_created || a.date_added || a.date,
   })).sort((a: any, b: any) => (b.date || '').localeCompare(a.date || ''));
-  res.json({ success: true, data: rows, total: rows.length });
+  res.json({ success: true, ...paginate(all, page, limit) });
 });
 
 // ── DMS (Delivery Management System) ─────────────────────────────────────────
@@ -1800,11 +1910,9 @@ router.get('/instances/:id/loans', async (req: Request, res: Response) => {
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
 
-  const [customers, sales, customerPayments, custKhata, custKhataPayments,
-         vendors, purchases, vendorPayments, vendKhata, vendKhataPayments] = await Promise.all([
+  const [customers, custKhata, custKhataPayments,
+         vendors, purchases, vendorPayments, vendKhata, vendKhataPayments, purchaseReturns] = await Promise.all([
     parseEntityFromSync(req.params.id, 'customer'),
-    parseEntityFromSync(req.params.id, 'sale'),
-    parseEntityFromSync(req.params.id, 'customer_payment'),
     parseEntityFromSync(req.params.id, 'customer_khata'),
     parseEntityFromSync(req.params.id, 'customer_khata_payment'),
     parseEntityFromSync(req.params.id, 'vendor'),
@@ -1812,58 +1920,50 @@ router.get('/instances/:id/loans', async (req: Request, res: Response) => {
     parseEntityFromSync(req.params.id, 'vendor_payment'),
     parseEntityFromSync(req.params.id, 'vendor_khata'),
     parseEntityFromSync(req.params.id, 'vendor_khata_payment'),
+    parseEntityFromSync(req.params.id, 'purchase_return'),
   ]);
 
-  const salesByC = new Map<string, number>();
-  for (const s of sales) {
-    const cid = String(s.customer_id ?? '');
-    if (!cid || cid === 'null' || cid === '0') continue;
-    if (s.status === 'Cancelled' || s.status === 'cancelled') continue;
-    salesByC.set(cid, (salesByC.get(cid) ?? 0) + (parseFloat(s.total) || 0));
-  }
-  // Add customer khata (custom bills) to customer totals
+  // Build khata net outstanding per customer (bills - payments) separately from regular sales
+  const custKhataIdsToCid = new Map<string, string>();
+  for (const k of custKhata) custKhataIdsToCid.set(String(k.id), String(k.customer_id ?? ''));
+  const khataNetByC = new Map<string, number>();
   for (const k of custKhata) {
     const cid = String(k.customer_id ?? '');
     if (!cid || cid === 'null' || cid === '0') continue;
-    salesByC.set(cid, (salesByC.get(cid) ?? 0) + (parseFloat(k.total_amount) || 0));
+    khataNetByC.set(cid, (khataNetByC.get(cid) ?? 0) + (parseFloat(k.total_amount) || 0));
   }
-  const cpByC = new Map<string, number>();
-  for (const p of customerPayments) {
-    const cid = String(p.customer_id ?? '');
-    if (!cid || cid === 'null') continue;
-    cpByC.set(cid, (cpByC.get(cid) ?? 0) + (parseFloat(p.amount) || 0));
-  }
-  // Add khata payments
-  const custKhataIdsToCid = new Map<string, string>();
-  for (const k of custKhata) custKhataIdsToCid.set(String(k.id), String(k.customer_id ?? ''));
   for (const p of custKhataPayments) {
     const cid = custKhataIdsToCid.get(String(p.khata_id ?? '')) ?? '';
     if (!cid || cid === 'null') continue;
-    cpByC.set(cid, (cpByC.get(cid) ?? 0) + (parseFloat(p.amount) || 0));
+    khataNetByC.set(cid, (khataNetByC.get(cid) ?? 0) - (parseFloat(p.amount) || 0));
   }
 
   const customerLoans = customers
     .map((c: any) => {
-      const cid   = String(c.id ?? '');
-      const total = salesByC.get(cid) ?? 0;
-      const paid  = cpByC.get(cid)   ?? 0;
+      const cid = String(c.id ?? '');
+      // Use POS-maintained outstanding_balance — includes full history (returns, adjustments)
+      const salesBal = Math.max(0, parseFloat(c.outstanding_balance) || 0);
+      const khataBal = Math.max(0, khataNetByC.get(cid) ?? 0);
+      const balance  = salesBal + khataBal;
       return {
         ...c,
         customer_id:   c.id,
         customer_name: c.name || c.customer_name || '—',
-        total_amount:  Math.round(total * 100) / 100,
-        paid_amount:   Math.round(paid  * 100) / 100,
-        balance:       Math.round(Math.max(0, total - paid) * 100) / 100,
+        total_amount:  Math.round(balance * 100) / 100,
+        paid_amount:   0,
+        balance:       Math.round(balance * 100) / 100,
       };
     })
     .filter((c: any) => c.balance > 0)
     .sort((a: any, b: any) => b.balance - a.balance);
 
   const purchByV = new Map<string, number>();
+  const purchIdToVendorLoans = new Map<string, string>();
   for (const p of purchases) {
     const vid = String(p.vendor_id ?? '');
     if (!vid || vid === 'null' || vid === '0') continue;
     purchByV.set(vid, (purchByV.get(vid) ?? 0) + (parseFloat(p.total) || 0));
+    purchIdToVendorLoans.set(String(p.id ?? ''), vid);
   }
   // Add vendor khata (custom bills) to vendor totals
   for (const k of vendKhata) {
@@ -1885,19 +1985,27 @@ router.get('/instances/:id/loans', async (req: Request, res: Response) => {
     if (!vid || vid === 'null') continue;
     vpByV.set(vid, (vpByV.get(vid) ?? 0) + (parseFloat(p.amount) || 0));
   }
+  // Subtract purchase returns from vendor owed totals
+  const retByV = new Map<string, number>();
+  for (const r of purchaseReturns) {
+    const vid = r.vendor_id ? String(r.vendor_id) : (purchIdToVendorLoans.get(String(r.purchase_id ?? '')) ?? '');
+    if (!vid || vid === 'null' || vid === '0') continue;
+    retByV.set(vid, (retByV.get(vid) ?? 0) + (parseFloat(r.total_returned ?? r.total ?? r.amount ?? '0') || 0));
+  }
 
   const vendorLoans = vendors
     .map((v: any) => {
-      const vid   = String(v.id ?? '');
-      const total = purchByV.get(vid) ?? 0;
-      const paid  = vpByV.get(vid)   ?? 0;
+      const vid      = String(v.id ?? '');
+      const total    = purchByV.get(vid) ?? 0;
+      const paid     = vpByV.get(vid)   ?? 0;
+      const returned = retByV.get(vid)  ?? 0;
       return {
         ...v,
-        vendor_id:   v.id,
-        vendor_name: v.name || v.vendor_name || '—',
-        total_amount: Math.round(total * 100) / 100,
-        paid_amount:  Math.round(paid  * 100) / 100,
-        balance:      Math.round(Math.max(0, total - paid) * 100) / 100,
+        vendor_id:    v.id,
+        vendor_name:  v.name || v.vendor_name || '—',
+        total_amount: Math.round(total         * 100) / 100,
+        paid_amount:  Math.round((paid + returned) * 100) / 100,
+        balance:      Math.round(Math.max(0, total - paid - returned) * 100) / 100,
       };
     })
     .filter((v: any) => v.balance > 0)
