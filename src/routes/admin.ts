@@ -1340,11 +1340,13 @@ router.get('/instances/:id/vendors', async (req: Request, res: Response) => {
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
   const { limit, page } = parsePage(req.query as Record<string, string>);
 
-  const [vendors, purchases, payments, purchaseReturns] = await Promise.all([
+  const [vendors, purchases, payments, purchaseReturns, vendorKhatas, vendorKhataPayments] = await Promise.all([
     parseEntityFromSync(req.params.id, 'vendor'),
     parseEntityFromSync(req.params.id, 'purchase'),
     parseEntityFromSync(req.params.id, 'vendor_payment'),
     parseEntityFromSync(req.params.id, 'purchase_return'),
+    parseEntityFromSync(req.params.id, 'vendor_khata'),
+    parseEntityFromSync(req.params.id, 'vendor_khata_payment'),
   ]);
 
   const purchMap = new Map<string, number>();
@@ -1352,6 +1354,7 @@ router.get('/instances/:id/vendors', async (req: Request, res: Response) => {
   for (const p of purchases) {
     const vid = String(p.vendor_id ?? '');
     if (!vid || vid === 'null' || vid === '0') continue;
+    if (p.status === 'Cancelled') continue;
     purchMap.set(vid, (purchMap.get(vid) ?? 0) + (parseFloat(p.total) || 0));
     purchIdToVendor.set(String(p.id ?? ''), vid);
   }
@@ -1361,17 +1364,32 @@ router.get('/instances/:id/vendors', async (req: Request, res: Response) => {
     if (!vid || vid === 'null') continue;
     payMap.set(vid, (payMap.get(vid) ?? 0) + (parseFloat(p.amount) || 0));
   }
-  // Subtract purchase returns from vendor owed totals
   const retMap = new Map<string, number>();
   for (const r of purchaseReturns) {
     const vid = r.vendor_id ? String(r.vendor_id) : (purchIdToVendor.get(String(r.purchase_id ?? '')) ?? '');
     if (!vid || vid === 'null' || vid === '0') continue;
     retMap.set(vid, (retMap.get(vid) ?? 0) + (parseFloat(r.total_returned ?? r.total ?? r.amount ?? '0') || 0));
   }
+  // Vendor khata (custom bills) net balance per vendor
+  const vkPaidMap = new Map<string, number>();
+  for (const p of vendorKhataPayments) {
+    const kid = String(p.khata_id ?? '');
+    if (!kid || kid === 'null') continue;
+    vkPaidMap.set(kid, (vkPaidMap.get(kid) ?? 0) + (parseFloat(p.amount) || 0));
+  }
+  const khataMap = new Map<string, number>();
+  for (const k of vendorKhatas) {
+    const vid = String(k.vendor_id ?? '');
+    if (!vid || vid === 'null' || vid === '0') continue;
+    const paid = vkPaidMap.get(String(k.id ?? '')) ?? 0;
+    const bal  = Math.max(0, (parseFloat(k.total_amount) || 0) - paid);
+    khataMap.set(vid, (khataMap.get(vid) ?? 0) + bal);
+  }
 
   const items = vendors.map((v: any) => {
     const vid = String(v.id ?? '');
-    const balance = Math.max(0, (purchMap.get(vid) ?? 0) - (payMap.get(vid) ?? 0) - (retMap.get(vid) ?? 0));
+    const purchaseBal = Math.max(0, (purchMap.get(vid) ?? 0) - (payMap.get(vid) ?? 0) - (retMap.get(vid) ?? 0));
+    const balance = purchaseBal + (khataMap.get(vid) ?? 0);
     return { ...v, balance: Math.round(balance * 100) / 100 };
   }).sort((a: any, b: any) => (b.balance - a.balance) || (a.name || '').localeCompare(b.name || ''));
 
