@@ -1324,45 +1324,105 @@ router.get('/instances/:id/period-stats', async (req: Request, res: Response) =>
 
   const { from, to } = req.query as { from?: string; to?: string };
 
-  const [sales, saleItems] = await Promise.all([
+  // Compute previous period date range (same duration, shifted back)
+  let prevFrom: string | undefined;
+  let prevTo:   string | undefined;
+  if (from && to) {
+    const msFrom = new Date(from).getTime();
+    const msTo   = new Date(to).getTime();
+    const dur    = msTo - msFrom + 86400000; // inclusive days in ms
+    prevTo   = new Date(msFrom - 86400000).toISOString().slice(0, 10);
+    prevFrom = new Date(msFrom - dur).toISOString().slice(0, 10);
+  }
+
+  // Always compute today (server date — matches POS localtime for same-TZ deployments)
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const ystStr   = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+
+  const [sales, saleItems, custPayments, purchases, expenses] = await Promise.all([
     parseEntityFromSync(req.params.id, 'sale'),
     parseEntityFromSync(req.params.id, 'sale_item'),
+    parseEntityFromSync(req.params.id, 'customer_payment'),
+    parseEntityFromSync(req.params.id, 'purchase'),
+    parseEntityFromSync(req.params.id, 'expense'),
   ]);
 
-  const inRange = (d: string | null): boolean => {
+  const dateOf = (e: any): string | null =>
+    (e.date_created || e.date_added || e.date || null)?.slice(0, 10) ?? null;
+
+  const inRange = (d: string | null, f?: string, t?: string): boolean => {
     if (!d) return false;
-    const dateStr = d.slice(0, 10);
-    if (from && dateStr < from) return false;
-    if (to   && dateStr > to)   return false;
+    if (f && d < f) return false;
+    if (t && d > t) return false;
     return true;
   };
 
-  const filteredSales = sales.filter((s: any) => {
-    const d = s.date_created || s.date_added || s.date || null;
-    return inRange(d) && s.status !== 'Cancelled' && s.status !== 'cancelled';
-  });
+  // Current period
+  const filtSales = sales.filter((s: any) => inRange(dateOf(s), from, to) && s.status !== 'Cancelled' && s.status !== 'cancelled');
+  const filtSaleIds = new Set(filtSales.map((s: any) => String(s.id)));
+  const filtItems = saleItems.filter((si: any) => filtSaleIds.has(String(si.sale_id)));
 
-  const saleIds = new Set(filteredSales.map((s: any) => String(s.id)));
-  const filteredItems = saleItems.filter((si: any) => saleIds.has(String(si.sale_id)));
-
-  const revenue  = filteredSales.reduce((sum: number, s: any) => sum + (parseFloat(s.total) || 0), 0);
-  const cogs     = filteredItems.reduce((sum: number, si: any) => {
+  const revenue = filtSales.reduce((s: number, x: any) => s + (parseFloat(x.total) || 0), 0);
+  const cogs    = filtItems.reduce((s: number, si: any) => {
     const pp = parseFloat(si.purchase_price) || 0;
-    if (pp <= 0) return sum;
-    return sum + pp * (parseFloat(si.quantity) || 0);
+    return pp > 0 ? s + pp * (parseFloat(si.quantity) || 0) : s;
   }, 0);
-  const hasGP    = filteredItems.some((si: any) => parseFloat(si.purchase_price) > 0);
-  const gp       = hasGP ? revenue - cogs : null;
+  const hasGP = filtItems.some((si: any) => parseFloat(si.purchase_price) > 0);
+  const gp    = hasGP ? revenue - cogs : null;
+
+  const cashCollected   = custPayments.filter((p: any) => inRange(dateOf(p), from, to)).reduce((s: number, p: any) => s + (parseFloat(p.amount) || 0), 0);
+  const periodPurchases = purchases.filter((p: any) => inRange(dateOf(p), from, to)).reduce((s: number, p: any) => s + (parseFloat(p.total) || 0), 0);
+  const periodExpenses  = expenses.filter((e: any) => inRange(dateOf(e), from, to)).reduce((s: number, e: any) => s + (parseFloat(e.amount) || 0), 0);
+
+  // Previous period (for % change)
+  const prevSales = prevFrom ? sales.filter((s: any) => inRange(dateOf(s), prevFrom, prevTo) && s.status !== 'Cancelled' && s.status !== 'cancelled') : [];
+  const prevRevenue      = prevSales.reduce((s: number, x: any) => s + (parseFloat(x.total) || 0), 0);
+  const prevTransactions = prevSales.length;
+  const prevSaleIds      = new Set(prevSales.map((s: any) => String(s.id)));
+  const prevItems        = saleItems.filter((si: any) => prevSaleIds.has(String(si.sale_id)));
+  const prevCogs         = prevItems.reduce((s: number, si: any) => {
+    const pp = parseFloat(si.purchase_price) || 0;
+    return pp > 0 ? s + pp * (parseFloat(si.quantity) || 0) : s;
+  }, 0);
+  const prevHasGP  = prevItems.some((si: any) => parseFloat(si.purchase_price) > 0);
+  const prevGP     = prevHasGP ? prevRevenue - prevCogs : null;
+
+  const pct = (cur: number, prev: number): number | null =>
+    prev > 0 ? Math.round((cur - prev) / prev * 1000) / 10 : null;
+
+  // Today vs yesterday
+  const todaySales = sales.filter((s: any) => dateOf(s) === todayStr && s.status !== 'Cancelled' && s.status !== 'cancelled');
+  const ystSales   = sales.filter((s: any) => dateOf(s) === ystStr   && s.status !== 'Cancelled' && s.status !== 'cancelled');
+  const todayRevenue = todaySales.reduce((s: number, x: any) => s + (parseFloat(x.total) || 0), 0);
+  const ystRevenue   = ystSales.reduce((s: number, x: any) => s + (parseFloat(x.total) || 0), 0);
+
+  const rnd = (v: number) => Math.round(v * 100) / 100;
 
   res.json({
     success: true,
     data: {
-      revenue:         Math.round(revenue * 100) / 100,
-      gross_profit:    gp !== null ? Math.round(gp * 100) / 100 : null,
-      cogs:            hasGP ? Math.round(cogs * 100) / 100 : null,
-      transactions:    filteredSales.length,
-      avg_transaction: filteredSales.length > 0 ? Math.round(revenue / filteredSales.length * 100) / 100 : 0,
-      has_cost_data:   hasGP,
+      revenue:          rnd(revenue),
+      gross_profit:     gp !== null ? rnd(gp) : null,
+      cogs:             hasGP ? rnd(cogs) : null,
+      transactions:     filtSales.length,
+      avg_transaction:  filtSales.length > 0 ? rnd(revenue / filtSales.length) : 0,
+      has_cost_data:    hasGP,
+      // Extended stats
+      cash_collected:   rnd(cashCollected),
+      period_purchases: rnd(periodPurchases),
+      period_expenses:  rnd(periodExpenses),
+      net_profit:       gp !== null ? rnd(gp - periodExpenses) : null,
+      // Today
+      today_revenue:    rnd(todayRevenue),
+      yesterday_revenue: rnd(ystRevenue),
+      today_pct_change: pct(todayRevenue, ystRevenue),
+      // Previous period % change
+      revenue_pct_change:      pct(revenue, prevRevenue),
+      transactions_pct_change: pct(filtSales.length, prevTransactions),
+      profit_pct_change:       (gp !== null && prevGP !== null) ? pct(gp, prevGP) : null,
+      prev_revenue:    rnd(prevRevenue),
+      prev_profit:     prevGP !== null ? rnd(prevGP) : null,
+      prev_transactions: prevTransactions,
     },
   });
 });
@@ -1373,10 +1433,12 @@ router.get('/instances/:id/customers/:cid/ledger', async (req: Request, res: Res
   const exists = await prisma.instance.findUnique({ where: { instance_id: id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
 
-  const [customers, sales, payments] = await Promise.all([
+  const [customers, sales, payments, khataEntries, khataPayments] = await Promise.all([
     parseEntityFromSync(id, 'customer'),
     parseEntityFromSync(id, 'sale'),
     parseEntityFromSync(id, 'customer_payment'),
+    parseEntityFromSync(id, 'customer_khata'),
+    parseEntityFromSync(id, 'customer_khata_payment'),
   ]);
 
   const customer = customers.find((c: any) => String(c.id) === cid);
@@ -1408,7 +1470,35 @@ router.get('/instances/:id/customers/:cid/ledger', async (req: Request, res: Res
       status: null,
     }));
 
-  const ledger = [...customerSales, ...customerPayments]
+  const customerKhata = khataEntries
+    .filter((k: any) => String(k.customer_id) === cid)
+    .map((k: any) => ({
+      id: k.id, entry_id: `khata-${k.id}`,
+      date: k.date_created || k.date_added || k.date || null,
+      type: 'khata_bill' as const,
+      description: k.title || `Custom Bill #${k.id}`,
+      debit: parseFloat(k.total_amount) || 0,
+      credit: 0,
+      payment_method: null,
+      status: null,
+    }));
+
+  // Build set of khata IDs belonging to this customer for fast filtering
+  const custKhataIds = new Set(khataEntries.filter((k: any) => String(k.customer_id) === cid).map((k: any) => String(k.id)));
+  const customerKhataPayments = khataPayments
+    .filter((p: any) => custKhataIds.has(String(p.khata_id)))
+    .map((p: any) => ({
+      id: p.id, entry_id: `khatapay-${p.id}`,
+      date: p.date_created || p.date_added || p.date || null,
+      type: 'khata_payment' as const,
+      description: p.note || 'Khata Payment',
+      debit: 0,
+      credit: parseFloat(p.amount) || 0,
+      payment_method: null,
+      status: null,
+    }));
+
+  const ledger = [...customerSales, ...customerPayments, ...customerKhata, ...customerKhataPayments]
     .sort((a, b) => (a.date || '').localeCompare(b.date || ''));
 
   let running = 0;
@@ -1417,8 +1507,10 @@ router.get('/instances/:id/customers/:cid/ledger', async (req: Request, res: Res
     return { ...row, running_balance: running };
   });
 
-  const totalSales = customerSales.reduce((s, r) => s + r.debit, 0);
-  const totalPaid  = customerPayments.reduce((s, r) => s + r.credit, 0);
+  const totalSales   = customerSales.reduce((s, r) => s + r.debit, 0);
+  const totalPaid    = customerPayments.reduce((s, r) => s + r.credit, 0);
+  const totalKhata   = customerKhata.reduce((s, r) => s + r.debit, 0);
+  const totalKhataPaid = customerKhataPayments.reduce((s, r) => s + r.credit, 0);
 
   res.json({
     success: true,
@@ -1426,9 +1518,9 @@ router.get('/instances/:id/customers/:cid/ledger', async (req: Request, res: Res
       customer,
       ledger: ledgerWithBalance,
       summary: {
-        total_sales:  Math.round(totalSales * 100) / 100,
-        total_paid:   Math.round(totalPaid  * 100) / 100,
-        outstanding:  Math.round(Math.max(0, totalSales - totalPaid) * 100) / 100,
+        total_sales:  Math.round((totalSales + totalKhata) * 100) / 100,
+        total_paid:   Math.round((totalPaid + totalKhataPaid) * 100) / 100,
+        outstanding:  Math.round(Math.max(0, (totalSales + totalKhata) - (totalPaid + totalKhataPaid)) * 100) / 100,
       },
     },
   });
@@ -1440,10 +1532,12 @@ router.get('/instances/:id/vendors/:vid/ledger', async (req: Request, res: Respo
   const exists = await prisma.instance.findUnique({ where: { instance_id: id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
 
-  const [vendors, purchases, payments] = await Promise.all([
+  const [vendors, purchases, payments, khataEntries, khataPayments] = await Promise.all([
     parseEntityFromSync(id, 'vendor'),
     parseEntityFromSync(id, 'purchase'),
     parseEntityFromSync(id, 'vendor_payment'),
+    parseEntityFromSync(id, 'vendor_khata'),
+    parseEntityFromSync(id, 'vendor_khata_payment'),
   ]);
 
   const vendor = vendors.find((v: any) => String(v.id) === vid);
@@ -1475,7 +1569,34 @@ router.get('/instances/:id/vendors/:vid/ledger', async (req: Request, res: Respo
       status: null,
     }));
 
-  const ledger = [...vendorPurchases, ...vendorPayments]
+  const vendorKhata = khataEntries
+    .filter((k: any) => String(k.vendor_id) === vid)
+    .map((k: any) => ({
+      id: k.id, entry_id: `khata-${k.id}`,
+      date: k.date_created || k.date_added || k.date || null,
+      type: 'khata_bill' as const,
+      description: k.title || `Custom Bill #${k.id}`,
+      debit: parseFloat(k.total_amount) || 0,
+      credit: 0,
+      payment_method: null,
+      status: null,
+    }));
+
+  const vendKhataIds = new Set(khataEntries.filter((k: any) => String(k.vendor_id) === vid).map((k: any) => String(k.id)));
+  const vendorKhataPayments = khataPayments
+    .filter((p: any) => vendKhataIds.has(String(p.khata_id)))
+    .map((p: any) => ({
+      id: p.id, entry_id: `khatapay-${p.id}`,
+      date: p.date_created || p.date_added || p.date || null,
+      type: 'khata_payment' as const,
+      description: p.note || 'Khata Payment',
+      debit: 0,
+      credit: parseFloat(p.amount) || 0,
+      payment_method: null,
+      status: null,
+    }));
+
+  const ledger = [...vendorPurchases, ...vendorPayments, ...vendorKhata, ...vendorKhataPayments]
     .sort((a, b) => (a.date || '').localeCompare(b.date || ''));
 
   let running = 0;
@@ -1484,8 +1605,10 @@ router.get('/instances/:id/vendors/:vid/ledger', async (req: Request, res: Respo
     return { ...row, running_balance: running };
   });
 
-  const totalPurchases = vendorPurchases.reduce((s, r) => s + r.debit, 0);
-  const totalPaid      = vendorPayments.reduce((s, r) => s + r.credit, 0);
+  const totalPurchases  = vendorPurchases.reduce((s, r) => s + r.debit, 0);
+  const totalPaid       = vendorPayments.reduce((s, r) => s + r.credit, 0);
+  const totalKhata      = vendorKhata.reduce((s, r) => s + r.debit, 0);
+  const totalKhataPaid  = vendorKhataPayments.reduce((s, r) => s + r.credit, 0);
 
   res.json({
     success: true,
@@ -1493,9 +1616,9 @@ router.get('/instances/:id/vendors/:vid/ledger', async (req: Request, res: Respo
       vendor,
       ledger: ledgerWithBalance,
       summary: {
-        total_purchases: Math.round(totalPurchases * 100) / 100,
-        total_paid:      Math.round(totalPaid      * 100) / 100,
-        outstanding:     Math.round(Math.max(0, totalPurchases - totalPaid) * 100) / 100,
+        total_purchases: Math.round((totalPurchases + totalKhata) * 100) / 100,
+        total_paid:      Math.round((totalPaid + totalKhataPaid) * 100) / 100,
+        outstanding:     Math.round(Math.max(0, (totalPurchases + totalKhata) - (totalPaid + totalKhataPaid)) * 100) / 100,
       },
     },
   });
@@ -1553,24 +1676,37 @@ router.get('/instances/:id/expenses', async (req: Request, res: Response) => {
 router.get('/instances/:id/returns', async (req: Request, res: Response) => {
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
-  const [saleReturns, purchaseReturns, customers, vendors] = await Promise.all([
+  const [saleReturns, purchaseReturns, customers, vendors, sales, purchases] = await Promise.all([
     parseEntityFromSync(req.params.id, 'sale_return'),
     parseEntityFromSync(req.params.id, 'purchase_return'),
     parseEntityFromSync(req.params.id, 'customer'),
     parseEntityFromSync(req.params.id, 'vendor'),
+    parseEntityFromSync(req.params.id, 'sale'),
+    parseEntityFromSync(req.params.id, 'purchase'),
   ]);
-  const custMap = new Map(customers.map((c: any) => [String(c.id), c.name || '—']));
-  const vendMap = new Map(vendors.map((v: any)  => [String(v.id), v.name || '—']));
-  const sr = saleReturns.map((r: any) => ({
-    ...r, _type: 'sale_return',
-    party_name: custMap.get(String(r.customer_id ?? '')) || r.customer_name || '—',
-    date: r.date_created || r.date_added || r.date,
-  })).sort((a: any, b: any) => (b.date || '').localeCompare(a.date || ''));
-  const pr = purchaseReturns.map((r: any) => ({
-    ...r, _type: 'purchase_return',
-    party_name: vendMap.get(String(r.vendor_id ?? '')) || r.vendor_name || '—',
-    date: r.date_created || r.date_added || r.date,
-  })).sort((a: any, b: any) => (b.date || '').localeCompare(a.date || ''));
+  const custMap   = new Map(customers.map((c: any) => [String(c.id), c.name || '—']));
+  const vendMap   = new Map(vendors.map((v: any)  => [String(v.id), v.name || '—']));
+  // Map sale_id / purchase_id → customer/vendor id for returns that lack a direct FK
+  const saleToCustomer    = new Map(sales.map((s: any)    => [String(s.id), String(s.customer_id ?? '')]));
+  const purchaseToVendor  = new Map(purchases.map((p: any) => [String(p.id), String(p.vendor_id   ?? '')]));
+  const sr = saleReturns.map((r: any) => {
+    const custId = r.customer_id ? String(r.customer_id) : saleToCustomer.get(String(r.sale_id ?? '')) ?? '';
+    return {
+      ...r, _type: 'sale_return',
+      party_name: custMap.get(custId) || r.customer_name || '—',
+      amount: parseFloat(r.total_returned ?? r.total ?? r.amount ?? 0),
+      date: r.date_created || r.date_added || r.date,
+    };
+  }).sort((a: any, b: any) => (b.date || '').localeCompare(a.date || ''));
+  const pr = purchaseReturns.map((r: any) => {
+    const vendId = r.vendor_id ? String(r.vendor_id) : purchaseToVendor.get(String(r.purchase_id ?? '')) ?? '';
+    return {
+      ...r, _type: 'purchase_return',
+      party_name: vendMap.get(vendId) || r.vendor_name || '—',
+      amount: parseFloat(r.total_returned ?? r.total ?? r.amount ?? 0),
+      date: r.date_created || r.date_added || r.date,
+    };
+  }).sort((a: any, b: any) => (b.date || '').localeCompare(a.date || ''));
   res.json({ success: true, sale_returns: sr, purchase_returns: pr });
 });
 
@@ -1664,13 +1800,18 @@ router.get('/instances/:id/loans', async (req: Request, res: Response) => {
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
 
-  const [customers, sales, customerPayments, vendors, purchases, vendorPayments] = await Promise.all([
+  const [customers, sales, customerPayments, custKhata, custKhataPayments,
+         vendors, purchases, vendorPayments, vendKhata, vendKhataPayments] = await Promise.all([
     parseEntityFromSync(req.params.id, 'customer'),
     parseEntityFromSync(req.params.id, 'sale'),
     parseEntityFromSync(req.params.id, 'customer_payment'),
+    parseEntityFromSync(req.params.id, 'customer_khata'),
+    parseEntityFromSync(req.params.id, 'customer_khata_payment'),
     parseEntityFromSync(req.params.id, 'vendor'),
     parseEntityFromSync(req.params.id, 'purchase'),
     parseEntityFromSync(req.params.id, 'vendor_payment'),
+    parseEntityFromSync(req.params.id, 'vendor_khata'),
+    parseEntityFromSync(req.params.id, 'vendor_khata_payment'),
   ]);
 
   const salesByC = new Map<string, number>();
@@ -1680,9 +1821,23 @@ router.get('/instances/:id/loans', async (req: Request, res: Response) => {
     if (s.status === 'Cancelled' || s.status === 'cancelled') continue;
     salesByC.set(cid, (salesByC.get(cid) ?? 0) + (parseFloat(s.total) || 0));
   }
+  // Add customer khata (custom bills) to customer totals
+  for (const k of custKhata) {
+    const cid = String(k.customer_id ?? '');
+    if (!cid || cid === 'null' || cid === '0') continue;
+    salesByC.set(cid, (salesByC.get(cid) ?? 0) + (parseFloat(k.total_amount) || 0));
+  }
   const cpByC = new Map<string, number>();
   for (const p of customerPayments) {
     const cid = String(p.customer_id ?? '');
+    if (!cid || cid === 'null') continue;
+    cpByC.set(cid, (cpByC.get(cid) ?? 0) + (parseFloat(p.amount) || 0));
+  }
+  // Add khata payments
+  const custKhataIdsToCid = new Map<string, string>();
+  for (const k of custKhata) custKhataIdsToCid.set(String(k.id), String(k.customer_id ?? ''));
+  for (const p of custKhataPayments) {
+    const cid = custKhataIdsToCid.get(String(p.khata_id ?? '')) ?? '';
     if (!cid || cid === 'null') continue;
     cpByC.set(cid, (cpByC.get(cid) ?? 0) + (parseFloat(p.amount) || 0));
   }
@@ -1710,9 +1865,23 @@ router.get('/instances/:id/loans', async (req: Request, res: Response) => {
     if (!vid || vid === 'null' || vid === '0') continue;
     purchByV.set(vid, (purchByV.get(vid) ?? 0) + (parseFloat(p.total) || 0));
   }
+  // Add vendor khata (custom bills) to vendor totals
+  for (const k of vendKhata) {
+    const vid = String(k.vendor_id ?? '');
+    if (!vid || vid === 'null' || vid === '0') continue;
+    purchByV.set(vid, (purchByV.get(vid) ?? 0) + (parseFloat(k.total_amount) || 0));
+  }
   const vpByV = new Map<string, number>();
   for (const p of vendorPayments) {
     const vid = String(p.vendor_id ?? '');
+    if (!vid || vid === 'null') continue;
+    vpByV.set(vid, (vpByV.get(vid) ?? 0) + (parseFloat(p.amount) || 0));
+  }
+  // Add vendor khata payments
+  const vendKhataIdsTovid = new Map<string, string>();
+  for (const k of vendKhata) vendKhataIdsTovid.set(String(k.id), String(k.vendor_id ?? ''));
+  for (const p of vendKhataPayments) {
+    const vid = vendKhataIdsTovid.get(String(p.khata_id ?? '')) ?? '';
     if (!vid || vid === 'null') continue;
     vpByV.set(vid, (vpByV.get(vid) ?? 0) + (parseFloat(p.amount) || 0));
   }
