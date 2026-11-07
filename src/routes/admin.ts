@@ -1317,6 +1317,190 @@ router.get('/instances/:id/vendors', async (req: Request, res: Response) => {
   res.json({ success: true, data: items, total: items.length });
 });
 
+// ── Period Stats (revenue + gross profit for a date range) ───────────────────
+router.get('/instances/:id/period-stats', async (req: Request, res: Response) => {
+  const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
+  if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  const { from, to } = req.query as { from?: string; to?: string };
+
+  const [sales, saleItems] = await Promise.all([
+    parseEntityFromSync(req.params.id, 'sale'),
+    parseEntityFromSync(req.params.id, 'sale_item'),
+  ]);
+
+  const inRange = (d: string | null): boolean => {
+    if (!d) return false;
+    const dateStr = d.slice(0, 10);
+    if (from && dateStr < from) return false;
+    if (to   && dateStr > to)   return false;
+    return true;
+  };
+
+  const filteredSales = sales.filter((s: any) => {
+    const d = s.date_created || s.date_added || s.date || null;
+    return inRange(d) && s.status !== 'Cancelled' && s.status !== 'cancelled';
+  });
+
+  const saleIds = new Set(filteredSales.map((s: any) => String(s.id)));
+  const filteredItems = saleItems.filter((si: any) => saleIds.has(String(si.sale_id)));
+
+  const revenue  = filteredSales.reduce((sum: number, s: any) => sum + (parseFloat(s.total) || 0), 0);
+  const cogs     = filteredItems.reduce((sum: number, si: any) => {
+    const pp = parseFloat(si.purchase_price) || 0;
+    if (pp <= 0) return sum;
+    return sum + pp * (parseFloat(si.quantity) || 0);
+  }, 0);
+  const hasGP    = filteredItems.some((si: any) => parseFloat(si.purchase_price) > 0);
+  const gp       = hasGP ? revenue - cogs : null;
+
+  res.json({
+    success: true,
+    data: {
+      revenue:         Math.round(revenue * 100) / 100,
+      gross_profit:    gp !== null ? Math.round(gp * 100) / 100 : null,
+      cogs:            hasGP ? Math.round(cogs * 100) / 100 : null,
+      transactions:    filteredSales.length,
+      avg_transaction: filteredSales.length > 0 ? Math.round(revenue / filteredSales.length * 100) / 100 : 0,
+      has_cost_data:   hasGP,
+    },
+  });
+});
+
+// ── Customer ledger (sales + payments for a specific customer) ───────────────
+router.get('/instances/:id/customers/:cid/ledger', async (req: Request, res: Response) => {
+  const { id, cid } = req.params;
+  const exists = await prisma.instance.findUnique({ where: { instance_id: id }, select: { id: true } });
+  if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  const [customers, sales, payments] = await Promise.all([
+    parseEntityFromSync(id, 'customer'),
+    parseEntityFromSync(id, 'sale'),
+    parseEntityFromSync(id, 'customer_payment'),
+  ]);
+
+  const customer = customers.find((c: any) => String(c.id) === cid);
+  if (!customer) { res.status(404).json({ success: false, error: 'Customer not found' }); return; }
+
+  const customerSales = sales
+    .filter((s: any) => String(s.customer_id) === cid && s.status !== 'Cancelled' && s.status !== 'cancelled')
+    .map((s: any) => ({
+      id: s.id, entry_id: `sale-${s.id}`,
+      date: s.date_created || s.date_added || s.date || null,
+      type: 'sale' as const,
+      description: `Sale #${s.id}`,
+      debit: parseFloat(s.total) || 0,
+      credit: 0,
+      payment_method: s.payment_method || null,
+      status: s.status || null,
+    }));
+
+  const customerPayments = payments
+    .filter((p: any) => String(p.customer_id) === cid)
+    .map((p: any) => ({
+      id: p.id, entry_id: `pay-${p.id}`,
+      date: p.date_created || p.date_added || p.date || null,
+      type: 'payment' as const,
+      description: p.note || p.description || 'Payment',
+      debit: 0,
+      credit: parseFloat(p.amount) || 0,
+      payment_method: p.payment_method || null,
+      status: null,
+    }));
+
+  const ledger = [...customerSales, ...customerPayments]
+    .sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+
+  let running = 0;
+  const ledgerWithBalance = ledger.map(row => {
+    running = Math.round((running + row.debit - row.credit) * 100) / 100;
+    return { ...row, running_balance: running };
+  });
+
+  const totalSales = customerSales.reduce((s, r) => s + r.debit, 0);
+  const totalPaid  = customerPayments.reduce((s, r) => s + r.credit, 0);
+
+  res.json({
+    success: true,
+    data: {
+      customer,
+      ledger: ledgerWithBalance,
+      summary: {
+        total_sales:  Math.round(totalSales * 100) / 100,
+        total_paid:   Math.round(totalPaid  * 100) / 100,
+        outstanding:  Math.round(Math.max(0, totalSales - totalPaid) * 100) / 100,
+      },
+    },
+  });
+});
+
+// ── Vendor ledger (purchases + payments for a specific vendor) ───────────────
+router.get('/instances/:id/vendors/:vid/ledger', async (req: Request, res: Response) => {
+  const { id, vid } = req.params;
+  const exists = await prisma.instance.findUnique({ where: { instance_id: id }, select: { id: true } });
+  if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  const [vendors, purchases, payments] = await Promise.all([
+    parseEntityFromSync(id, 'vendor'),
+    parseEntityFromSync(id, 'purchase'),
+    parseEntityFromSync(id, 'vendor_payment'),
+  ]);
+
+  const vendor = vendors.find((v: any) => String(v.id) === vid);
+  if (!vendor) { res.status(404).json({ success: false, error: 'Vendor not found' }); return; }
+
+  const vendorPurchases = purchases
+    .filter((p: any) => String(p.vendor_id) === vid)
+    .map((p: any) => ({
+      id: p.id, entry_id: `pur-${p.id}`,
+      date: p.date_created || p.date_added || p.date || null,
+      type: 'purchase' as const,
+      description: `Purchase #${p.id}${p.bill_no ? ` (${p.bill_no})` : ''}`,
+      debit: parseFloat(p.total) || 0,
+      credit: 0,
+      payment_method: p.payment_method || null,
+      status: p.status || null,
+    }));
+
+  const vendorPayments = payments
+    .filter((p: any) => String(p.vendor_id) === vid)
+    .map((p: any) => ({
+      id: p.id, entry_id: `pay-${p.id}`,
+      date: p.date_created || p.date_added || p.date || null,
+      type: 'payment' as const,
+      description: p.note || p.description || 'Payment',
+      debit: 0,
+      credit: parseFloat(p.amount) || 0,
+      payment_method: p.payment_method || null,
+      status: null,
+    }));
+
+  const ledger = [...vendorPurchases, ...vendorPayments]
+    .sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+
+  let running = 0;
+  const ledgerWithBalance = ledger.map(row => {
+    running = Math.round((running + row.debit - row.credit) * 100) / 100;
+    return { ...row, running_balance: running };
+  });
+
+  const totalPurchases = vendorPurchases.reduce((s, r) => s + r.debit, 0);
+  const totalPaid      = vendorPayments.reduce((s, r) => s + r.credit, 0);
+
+  res.json({
+    success: true,
+    data: {
+      vendor,
+      ledger: ledgerWithBalance,
+      summary: {
+        total_purchases: Math.round(totalPurchases * 100) / 100,
+        total_paid:      Math.round(totalPaid      * 100) / 100,
+        outstanding:     Math.round(Math.max(0, totalPurchases - totalPaid) * 100) / 100,
+      },
+    },
+  });
+});
+
 router.get('/instances/:id/purchases', async (req: Request, res: Response) => {
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
@@ -1363,6 +1547,79 @@ router.get('/instances/:id/expenses', async (req: Request, res: Response) => {
 
   res.json({ success: true, data: expenseRows, employees: employeeRows,
              total: expenseRows.length, totalEmployees: employeeRows.length });
+});
+
+// ── Returns (sale returns + purchase returns) ─────────────────────────────────
+router.get('/instances/:id/returns', async (req: Request, res: Response) => {
+  const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
+  if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+  const [saleReturns, purchaseReturns, customers, vendors] = await Promise.all([
+    parseEntityFromSync(req.params.id, 'sale_return'),
+    parseEntityFromSync(req.params.id, 'purchase_return'),
+    parseEntityFromSync(req.params.id, 'customer'),
+    parseEntityFromSync(req.params.id, 'vendor'),
+  ]);
+  const custMap = new Map(customers.map((c: any) => [String(c.id), c.name || '—']));
+  const vendMap = new Map(vendors.map((v: any)  => [String(v.id), v.name || '—']));
+  const sr = saleReturns.map((r: any) => ({
+    ...r, _type: 'sale_return',
+    party_name: custMap.get(String(r.customer_id ?? '')) || r.customer_name || '—',
+    date: r.date_created || r.date_added || r.date,
+  })).sort((a: any, b: any) => (b.date || '').localeCompare(a.date || ''));
+  const pr = purchaseReturns.map((r: any) => ({
+    ...r, _type: 'purchase_return',
+    party_name: vendMap.get(String(r.vendor_id ?? '')) || r.vendor_name || '—',
+    date: r.date_created || r.date_added || r.date,
+  })).sort((a: any, b: any) => (b.date || '').localeCompare(a.date || ''));
+  res.json({ success: true, sale_returns: sr, purchase_returns: pr });
+});
+
+// ── Stock Adjustments ─────────────────────────────────────────────────────────
+router.get('/instances/:id/stock-adjustments', async (req: Request, res: Response) => {
+  const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
+  if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+  const [adjustments, products] = await Promise.all([
+    parseEntityFromSync(req.params.id, 'stock_adjustment'),
+    parseEntityFromSync(req.params.id, 'product'),
+  ]);
+  const prodMap = new Map(products.map((p: any) => [String(p.id), p.name || '—']));
+  const rows = adjustments.map((a: any) => ({
+    ...a,
+    product_name: prodMap.get(String(a.product_id ?? '')) || a.product_name || '—',
+    date: a.date_created || a.date_added || a.date,
+  })).sort((a: any, b: any) => (b.date || '').localeCompare(a.date || ''));
+  res.json({ success: true, data: rows, total: rows.length });
+});
+
+// ── Employee Advances ─────────────────────────────────────────────────────────
+router.get('/instances/:id/employee-advances', async (req: Request, res: Response) => {
+  const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
+  if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+  const [advances, employees] = await Promise.all([
+    parseEntityFromSync(req.params.id, 'employee_advance'),
+    parseEntityFromSync(req.params.id, 'employee'),
+  ]);
+  const empMap = new Map(employees.map((e: any) => [String(e.id), e.name || '—']));
+  const rows = advances.map((a: any) => ({
+    ...a,
+    employee_name: empMap.get(String(a.employee_id ?? '')) || a.employee_name || '—',
+    date: a.date_created || a.date_added || a.date,
+  })).sort((a: any, b: any) => (b.date || '').localeCompare(a.date || ''));
+  res.json({ success: true, data: rows, total: rows.length });
+});
+
+// ── DMS (Delivery Management System) ─────────────────────────────────────────
+router.get('/instances/:id/dms', async (req: Request, res: Response) => {
+  const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
+  if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+  const [companies, orders, recoveries, partnerships, drawings] = await Promise.all([
+    parseEntityFromSync(req.params.id, 'dms_company'),
+    parseEntityFromSync(req.params.id, 'dms_order'),
+    parseEntityFromSync(req.params.id, 'dms_recovery'),
+    parseEntityFromSync(req.params.id, 'dms_partnership'),
+    parseEntityFromSync(req.params.id, 'dms_partner_drawing'),
+  ]);
+  res.json({ success: true, companies, orders, recoveries, partnerships, drawings });
 });
 
 // ── Accounts & Cash ────────────────────────────────────────────────────────────
