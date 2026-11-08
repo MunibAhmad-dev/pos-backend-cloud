@@ -721,6 +721,153 @@ router.get('/instances/:id', async (req: Request, res: Response) => {
   });
 });
 
+// ── Recalculate stats from raw sync data ──────────────────────────────────────
+// Derives inventory stats and sales stats entirely from sync_events, ignoring
+// corrupted price fields on product records (uses sale_items as ground truth).
+router.post('/instances/:id/recalculate', async (req: Request, res: Response) => {
+  const instance = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
+  if (!instance) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+
+  const [sales, saleItems, saleReturns, saleReturnItems, customers, customerPayments, products, expenses] = await Promise.all([
+    parseEntityFromSync(req.params.id, 'sale'),
+    parseEntityFromSync(req.params.id, 'sale_item'),
+    parseEntityFromSync(req.params.id, 'sale_return'),
+    parseEntityFromSync(req.params.id, 'sale_return_item'),
+    parseEntityFromSync(req.params.id, 'customer'),
+    parseEntityFromSync(req.params.id, 'customer_payment'),
+    parseEntityFromSync(req.params.id, 'product'),
+    parseEntityFromSync(req.params.id, 'expense'),
+  ]);
+
+  const CANCELLED = new Set(['cancelled', 'void', 'refunded', 'Cancelled', 'Void', 'Refunded']);
+  const activeSales = sales.filter((s: any) => !CANCELLED.has(s.status || ''));
+  const activeSaleIds = new Set(activeSales.map((s: any) => String(s.id)));
+
+  // Build cost map from active sale_items
+  const activeSaleItems = saleItems.filter((si: any) => activeSaleIds.has(String(si.sale_id)));
+  const saleItemCostMap = new Map<string, number>();
+  for (const si of activeSaleItems) {
+    const pp = Math.min(parseFloat(si.purchase_price) || 0, MAX_UNIT_PKR);
+    if (pp > 0) saleItemCostMap.set(String(si.id ?? ''), pp);
+  }
+
+  // Build return item lookup
+  const retItemsByReturn = new Map<string, any[]>();
+  for (const ri of saleReturnItems) {
+    const rid = String(ri.return_id ?? '');
+    if (!retItemsByReturn.has(rid)) retItemsByReturn.set(rid, []);
+    retItemsByReturn.get(rid)!.push(ri);
+  }
+
+  // Revenue: sum of active sales minus all return amounts
+  const grossRevenue = activeSales.reduce((s: number, x: any) => s + (parseFloat(x.total) || 0), 0);
+  const totalReturnedAmt = saleReturns.reduce((s: number, r: any) => s + (parseFloat(r.total_returned) || 0), 0);
+  const netRevenue = grossRevenue - totalReturnedAmt;
+
+  // COGS: from active sale_items, then subtract returned COGS
+  let totalCOGS = 0;
+  let itemsWithCost = 0;
+  for (const si of activeSaleItems) {
+    const qty  = Math.max(0, parseFloat(si.quantity) || 0);
+    const cost = saleItemCostMap.get(String(si.id ?? '')) ?? 0;
+    if (cost > 0) { totalCOGS += qty * cost; itemsWithCost++; }
+  }
+  for (const r of saleReturns) {
+    for (const ri of retItemsByReturn.get(String(r.id ?? '')) ?? []) {
+      const cost = saleItemCostMap.get(String(ri.sale_item_id ?? '')) ?? 0;
+      totalCOGS -= cost * (parseFloat(ri.quantity) || 0);
+    }
+  }
+  totalCOGS = Math.max(0, totalCOGS);
+
+  const hasGP = itemsWithCost > 0;
+  const gross_profit = hasGP ? Math.round(netRevenue - totalCOGS) : null;
+
+  // Date range from active sales
+  const saleDates = activeSales.map((s: any) => s.date_created || s.date_added || s.date).filter(Boolean);
+  const firstSaleDate = saleDates.length > 0 ? saleDates.reduce((a: string, b: string) => a < b ? a : b) : null;
+  const lastSaleDate  = saleDates.length > 0 ? saleDates.reduce((a: string, b: string) => a > b ? a : b) : null;
+  const daysActive = firstSaleDate
+    ? Math.max(1, Math.ceil((Date.now() - new Date(firstSaleDate).getTime()) / 86_400_000))
+    : null;
+  const gross_profit_per_day = (gross_profit != null && daysActive) ? Math.round(gross_profit / daysActive) : null;
+
+  // Derive last-known real price per product from sale_items to fix corrupted product records
+  const derivedPriceMap = new Map<string, { price: number; cost: number }>();
+  for (const si of activeSaleItems) {
+    const pid = String(si.product_id ?? '');
+    if (!pid) continue;
+    const price = parseFloat(si.price) || parseFloat(si.sale_price) || 0;
+    const cost  = parseFloat(si.purchase_price) || 0;
+    if (price > 0 && price <= MAX_UNIT_PKR) {
+      derivedPriceMap.set(pid, { price, cost: Math.min(cost, MAX_UNIT_PKR) });
+    }
+  }
+
+  // Fix corrupted product prices before computing inventory stats
+  const correctedProducts = products.map((p: any) => {
+    const pid = String(p.id ?? p.barcode ?? '');
+    const derived = pid ? derivedPriceMap.get(pid) : undefined;
+    if (!derived) return p;
+    const rawPrice = getFirstNumber(p, ['price', 'sale_price', 'selling_price', 'retail_price']);
+    const rawCost  = getFirstNumber(p, ['purchase_price', 'cost_price', 'buying_price', 'wholesale_price', 'unit_cost', 'cost']);
+    return {
+      ...p,
+      price:          rawPrice > MAX_UNIT_PKR ? derived.price : p.price,
+      purchase_price: rawCost  > MAX_UNIT_PKR ? derived.cost  : p.purchase_price,
+    };
+  });
+  const inventoryStats = calculateInventoryStats(correctedProducts);
+
+  // Customer outstanding: computed fresh from sales - returns - payments
+  // (never trusts stored outstanding_balance which may be corrupted)
+  const salesByCustomer = new Map<string, number>();
+  for (const s of activeSales) {
+    const cid = String(s.customer_id ?? '');
+    if (!cid || cid === 'null' || cid === '0') continue;
+    salesByCustomer.set(cid, (salesByCustomer.get(cid) ?? 0) + (parseFloat(s.total) || 0));
+  }
+  const returnsByCust = new Map<string, number>();
+  const saleCustomerMap = new Map(activeSales.map((s: any) => [String(s.id), String(s.customer_id ?? '')]));
+  for (const r of saleReturns) {
+    const cid = saleCustomerMap.get(String(r.sale_id ?? '')) ?? '';
+    if (!cid || cid === 'null' || cid === '0') continue;
+    returnsByCust.set(cid, (returnsByCust.get(cid) ?? 0) + (parseFloat(r.total_returned) || 0));
+  }
+  const paymentsByCust = new Map<string, number>();
+  for (const p of customerPayments) {
+    const cid = String(p.customer_id ?? '');
+    if (!cid || cid === 'null' || cid === '0') continue;
+    paymentsByCust.set(cid, (paymentsByCust.get(cid) ?? 0) + (parseFloat(p.amount) || 0));
+  }
+  const customerDebt = Array.from(salesByCustomer.keys()).reduce((sum, cid) => {
+    const owed = (salesByCustomer.get(cid) ?? 0) - (returnsByCust.get(cid) ?? 0) - (paymentsByCust.get(cid) ?? 0);
+    return sum + Math.max(0, owed);
+  }, 0);
+
+  const totalExpenses = expenses.reduce((s: number, e: any) => s + (parseFloat(e.amount) || 0), 0);
+
+  const rnd = (v: number) => Math.round(v * 100) / 100;
+  res.json({
+    success: true,
+    data: {
+      inventoryStats,
+      salesStats: {
+        total_synced_sales:   activeSales.length,
+        synced_revenue:       rnd(netRevenue),
+        last_sale_date:       lastSaleDate,
+        first_sale_date:      firstSaleDate,
+        gross_profit,
+        gross_profit_per_day,
+        days_active:          daysActive,
+        cogs_coverage_items:  itemsWithCost,
+      },
+      customer_debt:  rnd(customerDebt),
+      total_expenses: rnd(totalExpenses),
+    },
+  });
+});
+
 // ── Set / reset customer password ─────────────────────────────────────────────
 router.post('/instances/:id/set-password', async (req: Request, res: Response) => {
   try {
