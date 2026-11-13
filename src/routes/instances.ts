@@ -677,32 +677,33 @@ router.get('/dashboard', requireInstance, async (req: Request, res: Response) =>
   // pulled the instance's ENTIRE sales history into a JS array just to sum
   // it, which on a large/long-running store could be a multi-hundred-MB
   // load on a single-process, memory-capped backend shared by every shop.
-  const now = new Date();
-  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-
   // date_created is a STRING column holding two formats: ISO ("2026-08-01T14:00:00.000Z",
   // web clients) and SQLite localtime ("2026-08-01 19:00:00", desktop). Comparing
   // against a full ISO timestamp breaks lexicographically for desktop rows
   // (' ' < 'T'), silently excluding every desktop sale from today/month revenue.
   // A date-only floor ("2026-08-01") compares correctly against BOTH formats.
-  const dayFloor = (d: Date) =>
-    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  // Floors are taken in Pakistan time (UTC+5) — the server runs in UTC, so its own
+  // midnight put 00:00–05:00 PKT sales on the wrong day.
+  const pkNow = new Date(Date.now() + 5 * 3600_000).toISOString();
+  const todayFloor = pkNow.slice(0, 10);
+  const monthFloor = `${pkNow.slice(0, 7)}-01`;
 
-  // Cancelled sales must never count toward revenue.
-  const notCancelled = { not: 'Cancelled' };
+  // Revenue statuses on the desktop: completed / paid / partial, in any case.
+  const activeStatus = {
+    OR: ['completed', 'paid', 'partial'].map((s) => ({ status: { equals: s, mode: 'insensitive' as const } })),
+  };
 
   const [todayAgg, monthAgg, totalAgg] = await Promise.all([
     prisma.instanceSale.aggregate({
-      where: { instance_id: instanceId, status: notCancelled, date_created: { gte: dayFloor(todayStart) } },
+      where: { instance_id: instanceId, ...activeStatus, date_created: { gte: todayFloor } },
       _sum: { total: true },
     }),
     prisma.instanceSale.aggregate({
-      where: { instance_id: instanceId, status: notCancelled, date_created: { gte: dayFloor(monthStart) } },
+      where: { instance_id: instanceId, ...activeStatus, date_created: { gte: monthFloor } },
       _sum: { total: true },
     }),
     prisma.instanceSale.aggregate({
-      where: { instance_id: instanceId, status: notCancelled },
+      where: { instance_id: instanceId, ...activeStatus },
       _sum: { total: true },
       _count: { _all: true },
     }),
@@ -771,7 +772,7 @@ router.get('/analytics', requireInstance, async (req: Request, res: Response) =>
   const salesRaw = await prisma.instanceSale.findMany({
     where: {
       instance_id: instanceId,
-      status: { not: 'Cancelled' },
+      OR: ['completed', 'paid', 'partial'].map((st) => ({ status: { equals: st, mode: 'insensitive' as const } })),
       date_created: { gte: dayFloorStr(new Date(from.getTime() - 86400000)), lt: dayFloorStr(dayAfterTo) },
     },
     select: { total: true, date_created: true },
@@ -825,56 +826,70 @@ router.get('/analytics', requireInstance, async (req: Request, res: Response) =>
       instance_id: instanceId, entity_type: 'sale_item',
       received_at: { gte: from, lte: to },
     },
-    select: { payload: true },
+    select: { payload: true, operation: true },
+    orderBy: { id: 'asc' },
     take: ANALYTICS_ROW_CAP,
   });
 
-  const productMap: Record<string, { name: string; quantity: number; revenue: number }> = {};
+  // Latest version per sale_item id — re-synced/edited lines were counted once per event.
+  const latestItems = new Map<string, any>();
   for (const e of productEvents) {
     try {
       const p = JSON.parse(e.payload) as any;
-      const pid = String(p.product_id ?? '');
-      const key = pid || String(p.product_name || p.name || '');
-      if (!key) continue;
-      const qty = Number(p.quantity ?? p.qty ?? 0);
-      // Prefer an explicit line total; fall back to unit price × qty.
-      let lineRev = Number(p.total ?? p.subtotal ?? p.line_total ?? p.total_price ?? p.amount ?? 0);
-      if (!lineRev) {
-        const unit = Number(p.price ?? p.unit_price ?? p.sale_price ?? priceById[pid] ?? 0);
-        lineRev = unit * qty;
-      }
-      if (!productMap[key]) {
-        productMap[key] = { name: p.product_name || p.name || nameById[pid] || key, quantity: 0, revenue: 0 };
-      }
-      productMap[key].quantity += qty;
-      productMap[key].revenue  += lineRev;
+      const key = String(p.id ?? Math.random());
+      if (e.operation === 'delete') latestItems.delete(key);
+      else latestItems.set(key, p);
     } catch { continue; }
+  }
+  const productMap: Record<string, { name: string; quantity: number; revenue: number }> = {};
+  for (const p of latestItems.values()) {
+    const pid = String(p.product_id ?? '');
+    const key = pid || String(p.product_name || p.name || '');
+    if (!key) continue;
+    const qty = Number(p.quantity ?? p.qty ?? 0);
+    // Prefer an explicit line total; fall back to unit price × qty.
+    let lineRev = Number(p.total ?? p.subtotal ?? p.line_total ?? p.total_price ?? p.amount ?? 0);
+    if (!lineRev) {
+      const unit = Number(p.price ?? p.unit_price ?? p.sale_price ?? priceById[pid] ?? 0);
+      lineRev = unit * qty;
+    }
+    if (!productMap[key]) {
+      productMap[key] = { name: p.product_name || p.name || nameById[pid] || key, quantity: 0, revenue: 0 };
+    }
+    productMap[key].quantity += qty;
+    productMap[key].revenue  += lineRev;
   }
   const topProducts = Object.entries(productMap)
     .map(([id, v]) => ({ product_id: id, ...v }))
     .sort((a, b) => b.revenue - a.revenue)
     .slice(0, 10);
 
-  // Expenses from sync_events (total + per-day for the P&L graph) — same
-  // missing-date-filter issue as sale_item above, fixed the same way.
   const expenseEvents = await prisma.syncEvent.findMany({
     where: {
-      instance_id: instanceId, entity_type: 'expense', operation: { not: 'delete' },
+      instance_id: instanceId, entity_type: 'expense',
       received_at: { gte: from, lte: to },
     },
-    select: { payload: true },
+    select: { payload: true, operation: true },
+    orderBy: { id: 'asc' },
     take: ANALYTICS_ROW_CAP,
   });
-  let totalExpenses = 0;
-  const expenseByDayMap: Record<string, number> = {};
+  // Latest version per expense id; deleted expenses drop out; bucketed by the expense's own date.
+  const latestExpenses = new Map<string, any>();
   for (const e of expenseEvents) {
     try {
       const x = JSON.parse(e.payload) as any;
-      const amt = Number(x.amount || 0);
-      totalExpenses += amt;
-      const day = String(x.date_added ?? x.date ?? x.created_at ?? '').slice(0, 10);
-      if (day) expenseByDayMap[day] = (expenseByDayMap[day] || 0) + amt;
+      const key = String(x.id ?? Math.random());
+      if (e.operation === 'delete') latestExpenses.delete(key);
+      else latestExpenses.set(key, x);
     } catch { continue; }
+  }
+  let totalExpenses = 0;
+  const expenseByDayMap: Record<string, number> = {};
+  for (const x of latestExpenses.values()) {
+    const amt = Number(x.amount || 0);
+    totalExpenses += amt;
+    const day = String(x.date_added ?? x.date ?? x.date_created ?? x.created_at ?? '').slice(0, 10);
+    if (day) expenseByDayMap[day] = (expenseByDayMap[day] || 0) + amt;
   }
   const expensesByDay = Object.entries(expenseByDayMap).map(([day, amount]) => ({ day, amount }));
 

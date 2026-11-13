@@ -65,14 +65,12 @@ router.get('/khata', requireInstance, async (req: Request, res: Response) => {
   const khataIds = new Set(customerKhata.map(k => String(k.id)));
   const paidByKhata = new Map<string, number>();
 
-  for (const ev of paymentEvents) {
-    let payload: any;
-    try { payload = JSON.parse(ev.payload); } catch { continue; }
-    const kid = String(payload?.khata_id ?? '');
+  // Latest version per payment id — summing every event counted edits twice, and delete
+  // events carry only {id}, so deleted payments were never subtracted.
+  for (const p of reconstructFromEvents(paymentEvents).values()) {
+    const kid = String(p?.khata_id ?? '');
     if (!khataIds.has(kid)) continue;
-    const amt = Number(payload?.amount ?? 0);
-    const prev = paidByKhata.get(kid) ?? 0;
-    paidByKhata.set(kid, ev.operation === 'delete' ? prev - amt : prev + amt);
+    paidByKhata.set(kid, (paidByKhata.get(kid) ?? 0) + Number(p?.amount ?? 0));
   }
 
   const data = customerKhata.map(k => {
@@ -98,13 +96,8 @@ router.get('/khata/:khataId/payments', requireInstance, async (req: Request, res
     select:  { operation: true, payload: true },
   });
 
-  const payments: any[] = [];
-  for (const ev of events) {
-    let payload: any;
-    try { payload = JSON.parse(ev.payload); } catch { continue; }
-    if (String(payload?.khata_id) !== khataId) continue;
-    if (ev.operation !== 'delete') payments.push(payload);
-  }
+  const payments = Array.from(reconstructFromEvents(events).values())
+    .filter((p: any) => String(p?.khata_id) === khataId);
 
   res.json({ success: true, data: payments });
 });
@@ -136,24 +129,21 @@ router.get('/khata/summary', requireInstance, async (req: Request, res: Response
   // Group khata total_amount by customer_id
   const totalByCustomer = new Map<string, number>();
   for (const k of khataMap.values()) {
+    if (String(k.status ?? '').toLowerCase() === 'closed') continue;
     const cid = String(k.customer_id ?? '');
     totalByCustomer.set(cid, (totalByCustomer.get(cid) ?? 0) + Number(k.total_amount ?? 0));
   }
 
   // Accumulate payments by khata_id → then map to customer_id
   const khataToCustomer = new Map<string, string>();
-  for (const k of khataMap.values()) khataToCustomer.set(String(k.id), String(k.customer_id ?? ''));
+  for (const k of khataMap.values()) if (String(k.status ?? '').toLowerCase() !== 'closed') khataToCustomer.set(String(k.id), String(k.customer_id ?? ''));
 
   const paidByCustomer = new Map<string, number>();
-  for (const ev of paymentEvents) {
-    let payload: any;
-    try { payload = JSON.parse(ev.payload); } catch { continue; }
-    const kid = String(payload?.khata_id ?? '');
+  for (const p of reconstructFromEvents(paymentEvents).values()) {
+    const kid = String(p?.khata_id ?? '');
     const cid = khataToCustomer.get(kid);
     if (!cid) continue;
-    const amt = Number(payload?.amount ?? 0);
-    const prev = paidByCustomer.get(cid) ?? 0;
-    paidByCustomer.set(cid, ev.operation === 'delete' ? prev - amt : prev + amt);
+    paidByCustomer.set(cid, (paidByCustomer.get(cid) ?? 0) + Number(p?.amount ?? 0));
   }
 
   const data = Array.from(totalByCustomer.entries()).map(([customer_id, total_khata]) => {

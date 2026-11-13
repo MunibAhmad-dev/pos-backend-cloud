@@ -76,7 +76,7 @@ model SyncEvent {
 model InstanceSale {
   id             Int      @id @default(autoincrement())
   instance_id    String
-  pos_sale_id    Int
+  pos_sale_id    BigInt   // POS ids can be timestamp-based (~1.7e15) and overflow INT4
   total          Float    @default(0)
   discount       Float    @default(0)
   payment_method String   @default("cash")

@@ -51,30 +51,28 @@ router.post('/', requireInstance, async (req: Request, res: Response) => {
   let hasProductEvents  = false;
 
   try {
-    await prisma.$transaction(async (tx) => {
-      for (const item of items) {
-        try {
-          const payloadStr = JSON.stringify(item.payload || {});
+    // Each item gets its own transaction: inside one shared Postgres transaction a single
+    // failing statement aborts every later item and the whole batch 500s, so one bad
+    // payload used to block the device's entire queue.
+    for (const item of items) {
+      try {
+        if (!item || typeof item.entity_type !== 'string' || typeof item.operation !== 'string') {
+          throw new Error('entity_type and operation are required');
+        }
+        // A \u0000 escape makes every later `payload::jsonb` cast in the read routes throw.
+        const payloadStr = JSON.stringify(item.payload || {}).replace(/\\u0000/g, '');
 
-          // Store the raw event — but skip exact duplicates to keep sync_events lean.
-          // Two events are considered identical when:
-          //   same instance + entity_type + operation + entity_id + payload content
-          // Duplicates arise when the POS runs full-resync multiple times.
-          const entityId = String(
-            item.payload?.id ?? item.payload?.barcode ?? item.payload?.name ?? ''
-          );
-
+        await prisma.$transaction(async (tx) => {
+          // Skip exact duplicate creates (full-resync re-pushes everything).
           let skipEvent = false;
-          if (entityId && item.operation === 'create') {
-            // Check if the latest create event for this entity has the exact same payload
-            const [dup] = await tx.$queryRaw<[{ cnt: bigint }]>(Prisma.sql`
+          if (item.operation === 'create') {
+            const [dup] = await tx.$queryRaw<[{ cnt: number }]>(Prisma.sql`
               SELECT COUNT(*)::int AS cnt
               FROM   sync_events
               WHERE  instance_id = ${inst.instance_id}
                 AND  entity_type = ${item.entity_type}
                 AND  operation   = 'create'
-                AND  payload::jsonb->>'id'      IS NOT DISTINCT FROM ${entityId}
-                AND  payload = ${payloadStr}
+                AND  payload     = ${payloadStr}
               LIMIT 1
             `);
             if (Number(dup?.cnt ?? 0) > 0) skipEvent = true;
@@ -91,77 +89,88 @@ router.post('/', requireInstance, async (req: Request, res: Response) => {
             });
           }
 
-          // Flatten sale creates into instance_sales (upsert — idempotent on re-sync)
-          if (item.entity_type === 'sale' && item.operation === 'create') {
-            const p      = item.payload;
-            const saleId = p.id ?? p.sale_id;
-            if (saleId) {
-              await tx.instanceSale.upsert({
-                where:  { instance_id_pos_sale_id: { instance_id: inst.instance_id, pos_sale_id: Number(saleId) } },
-                create: {
-                  instance_id:    inst.instance_id,
-                  pos_sale_id:    Number(saleId),
-                  total:          Number(p.total          || 0),
-                  discount:       Number(p.discount       || 0),
-                  payment_method: p.payment_method        || 'cash',
-                  payment_status: p.payment_status        || 'Paid',
-                  status:         p.status                || 'Completed',
-                  items_count:    Number(p.item_count || p.items_count || 0),
-                  items_summary:  p.items_summary         || '',
-                  date_created:   p.date_created          || null,
-                },
-                update: {
-                  total:          Number(p.total          || 0),
-                  discount:       Number(p.discount       || 0),
-                  payment_method: p.payment_method        || 'cash',
-                  payment_status: p.payment_status        || 'Paid',
-                  status:         p.status                || 'Completed',
-                  items_count:    Number(p.item_count || p.items_count || 0),
-                  items_summary:  p.items_summary         || '',
-                  date_created:   p.date_created          || null,
-                },
-              });
-              // Mark that sales were touched so we recalculate totals below
-              newSalesCount   = 1;   // signal: at least one sale was upserted
-              newSalesRevenue = 1;   // will be replaced by real aggregate below
+          // instance_sales must follow every sale change (cancel, return, payment status),
+          // not only the first create, or admin sales/revenue keep the original state forever.
+          if (item.entity_type === 'sale') {
+            const p      = item.payload || {};
+            const saleNum = Number(p.id ?? p.sale_id);
+            if (Number.isSafeInteger(saleNum) && saleNum > 0) {
+              const saleId = BigInt(saleNum);
+              const key = { instance_id_pos_sale_id: { instance_id: inst.instance_id, pos_sale_id: saleId } };
+              if (item.operation === 'delete') {
+                await tx.instanceSale.deleteMany({ where: { instance_id: inst.instance_id, pos_sale_id: saleId } });
+              } else {
+                const has = (k: string) => p[k] !== undefined && p[k] !== null;
+                const itemsCount = has('item_count') ? p.item_count : (has('items_count') ? p.items_count : undefined);
+                const common = {
+                  total:          Number(p.total    || 0),
+                  discount:       Number(p.discount || 0),
+                  payment_method: p.payment_method  || 'cash',
+                  payment_status: p.payment_status  || 'Paid',
+                  status:         p.status          || 'Completed',
+                  date_created:   p.date_created    || null,
+                };
+                await tx.instanceSale.upsert({
+                  where:  key,
+                  create: {
+                    instance_id:   inst.instance_id,
+                    pos_sale_id:   saleId,
+                    ...common,
+                    items_count:   Number(itemsCount || 0),
+                    items_summary: p.items_summary || '',
+                  },
+                  // Update payloads are plain `SELECT * FROM sales` rows without the joined
+                  // item fields — keep the stored ones instead of zeroing them.
+                  update: {
+                    ...common,
+                    ...(itemsCount !== undefined ? { items_count: Number(itemsCount || 0) } : {}),
+                    ...(has('items_summary') ? { items_summary: String(p.items_summary) } : {}),
+                  },
+                });
+              }
+              newSalesCount   = 1;
+              newSalesRevenue = 1;
             }
           }
+        });
 
-          if (item.entity_type === 'customer') hasCustomerEvents = true;
-          if (item.entity_type === 'product')  hasProductEvents  = true;
+        if (item.entity_type === 'customer') hasCustomerEvents = true;
+        if (item.entity_type === 'product')  hasProductEvents  = true;
 
-          results.push({ local_id: item.local_id, success: true });
-          synced++;
-        } catch (err: any) {
-          results.push({ local_id: item.local_id, success: false, error: err.message });
-        }
+        results.push({ local_id: item.local_id, success: true });
+        synced++;
+      } catch (err: any) {
+        results.push({ local_id: item?.local_id, success: false, error: err.message });
       }
+    }
+
+    await prisma.$transaction(async (tx) => {
 
       // Recount distinct customer / product IDs from sync_events for accurate totals
       let customerCount: number | null = null;
       let productCount:  number | null = null;
 
-      if (hasCustomerEvents) {
-        const [row] = await tx.$queryRaw<[{ cnt: bigint }]>(Prisma.sql`
-          SELECT COUNT(DISTINCT (payload::jsonb)->>'id')::int AS cnt
-          FROM sync_events
-          WHERE instance_id = ${inst.instance_id}
-            AND entity_type = 'customer'
-            AND operation   = 'create'
+      // Count entities whose latest event is not a delete (create-only counts kept
+      // deleted customers/products forever).
+      const liveCount = async (entityType: string) => {
+        const [row] = await tx.$queryRaw<[{ cnt: number }]>(Prisma.sql`
+          SELECT COUNT(*)::int AS cnt FROM (
+            SELECT DISTINCT ON (eid) operation
+            FROM (
+              SELECT id, operation, substring(payload from '"id":"?([^",}]*)') AS eid
+              FROM   sync_events
+              WHERE  instance_id = ${inst.instance_id}
+                AND  entity_type = ${entityType}
+            ) e
+            WHERE eid IS NOT NULL
+            ORDER BY eid, id DESC
+          ) latest
+          WHERE operation <> 'delete'
         `);
-        customerCount = Number(row?.cnt ?? 0);
-      }
-
-      if (hasProductEvents) {
-        const [row] = await tx.$queryRaw<[{ cnt: bigint }]>(Prisma.sql`
-          SELECT COUNT(DISTINCT (payload::jsonb)->>'id')::int AS cnt
-          FROM sync_events
-          WHERE instance_id = ${inst.instance_id}
-            AND entity_type = 'product'
-            AND operation   = 'create'
-        `);
-        productCount = Number(row?.cnt ?? 0);
-      }
+        return Number(row?.cnt ?? 0);
+      };
+      if (hasCustomerEvents) customerCount = await liveCount('customer');
+      if (hasProductEvents)  productCount  = await liveCount('product');
 
       // ── Recalculate sale aggregates from source-of-truth ─────────────────────
       // NEVER use increment() for totals — re-syncing the same sale would inflate
@@ -175,7 +184,7 @@ router.post('/', requireInstance, async (req: Request, res: Response) => {
                  COALESCE(SUM(total), 0)::float AS rev
           FROM   instance_sales
           WHERE  instance_id = ${inst.instance_id}
-            AND  status      = 'Completed'
+            AND  LOWER(status) IN ('completed', 'paid', 'partial')
         `);
         realSalesCount   = Number(agg?.cnt ?? 0);
         realSalesRevenue = Number(agg?.rev ?? 0);
@@ -192,6 +201,9 @@ router.post('/', requireInstance, async (req: Request, res: Response) => {
           total_products:  productCount     != null ? productCount     : undefined,
         },
       });
+    }).catch((err: any) => {
+      // Items are already stored; failing the response here would make the POS resend them.
+      console.error('[sync] aggregate refresh failed:', err?.message);
     });
 
     res.json({ success: true, synced, total: items.length, results });

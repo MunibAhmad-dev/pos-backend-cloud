@@ -65,14 +65,12 @@ router.get('/khata', requireInstance, async (req: Request, res: Response) => {
   const khataIds = new Set(vendorKhata.map(k => String(k.id)));
   const paidByKhata = new Map<string, number>();
 
-  for (const ev of paymentEvents) {
-    let payload: any;
-    try { payload = JSON.parse(ev.payload); } catch { continue; }
-    const kid = String(payload?.khata_id ?? '');
+  // Latest version per payment id — summing every event counted edits twice, and delete
+  // events carry only {id}, so deleted payments were never subtracted.
+  for (const p of reconstructFromEvents(paymentEvents).values()) {
+    const kid = String(p?.khata_id ?? '');
     if (!khataIds.has(kid)) continue;
-    const amt = Number(payload?.amount ?? 0);
-    const prev = paidByKhata.get(kid) ?? 0;
-    paidByKhata.set(kid, ev.operation === 'delete' ? prev - amt : prev + amt);
+    paidByKhata.set(kid, (paidByKhata.get(kid) ?? 0) + Number(p?.amount ?? 0));
   }
 
   const data = vendorKhata.map(k => {
@@ -98,13 +96,8 @@ router.get('/khata/:khataId/payments', requireInstance, async (req: Request, res
     select:  { operation: true, payload: true },
   });
 
-  const payments: any[] = [];
-  for (const ev of events) {
-    let payload: any;
-    try { payload = JSON.parse(ev.payload); } catch { continue; }
-    if (String(payload?.khata_id) !== khataId) continue;
-    if (ev.operation !== 'delete') payments.push(payload);
-  }
+  const payments = Array.from(reconstructFromEvents(events).values())
+    .filter((p: any) => String(p?.khata_id) === khataId);
 
   res.json({ success: true, data: payments });
 });
@@ -136,24 +129,21 @@ router.get('/khata/summary', requireInstance, async (req: Request, res: Response
   // Group khata total_amount by vendor_id
   const totalByVendor = new Map<string, number>();
   for (const k of khataMap.values()) {
+    if (String(k.status ?? '').toLowerCase() === 'closed') continue;
     const vid = String(k.vendor_id ?? '');
     totalByVendor.set(vid, (totalByVendor.get(vid) ?? 0) + Number(k.total_amount ?? 0));
   }
 
   // Accumulate payments by khata_id → then map to vendor_id
   const khataToVendor = new Map<string, string>();
-  for (const k of khataMap.values()) khataToVendor.set(String(k.id), String(k.vendor_id ?? ''));
+  for (const k of khataMap.values()) if (String(k.status ?? '').toLowerCase() !== 'closed') khataToVendor.set(String(k.id), String(k.vendor_id ?? ''));
 
   const paidByVendor = new Map<string, number>();
-  for (const ev of paymentEvents) {
-    let payload: any;
-    try { payload = JSON.parse(ev.payload); } catch { continue; }
-    const kid = String(payload?.khata_id ?? '');
+  for (const p of reconstructFromEvents(paymentEvents).values()) {
+    const kid = String(p?.khata_id ?? '');
     const vid = khataToVendor.get(kid);
     if (!vid) continue;
-    const amt = Number(payload?.amount ?? 0);
-    const prev = paidByVendor.get(vid) ?? 0;
-    paidByVendor.set(vid, ev.operation === 'delete' ? prev - amt : prev + amt);
+    paidByVendor.set(vid, (paidByVendor.get(vid) ?? 0) + Number(p?.amount ?? 0));
   }
 
   const data = Array.from(totalByVendor.entries()).map(([vendor_id, total_khata]) => {
