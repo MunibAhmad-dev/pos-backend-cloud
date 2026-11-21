@@ -2,6 +2,10 @@ import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import bcrypt from 'bcryptjs';
 import prisma from '../db';
+import {
+  rejectBlockedIp, allowAccountCreation, noteAccountCreated,
+  allowSignInAttempt, noteFailedSignIn, noteSuccessfulSignIn, validMobile,
+} from '../middleware/accountGuard';
 
 const router = Router();
 
@@ -12,7 +16,7 @@ const router = Router();
  * Creates an instance with approval_status = 'pending' and returns the api_key.
  * Idempotent — returns existing api_key if already registered (same mobile + branch).
  */
-router.post('/register-business', async (req: Request, res: Response) => {
+router.post('/register-business', rejectBlockedIp, async (req: Request, res: Response) => {
   const { businessName, ownerName, mobile, email, address, fingerprint, branchName, password, mode, branchCode } =
     req.body as Record<string, string>;
 
@@ -70,11 +74,14 @@ router.post('/register-business', async (req: Request, res: Response) => {
 
       // ── Sign-in / idempotent re-registration ─────────────────────────────────
       if (existing.password_hash && password) {
+        if (!allowSignInAttempt(req, res, mobile.trim())) return;
         const ok = await bcrypt.compare(password, existing.password_hash);
         if (!ok) {
+          noteFailedSignIn(req, mobile.trim());
           res.status(401).json({ success: false, error: 'Incorrect password' });
           return;
         }
+        noteSuccessfulSignIn(mobile.trim());
       } else if (existing.password_hash && !password) {
         res.status(401).json({ success: false, error: 'Password required for this account' });
         return;
@@ -125,8 +132,24 @@ router.post('/register-business', async (req: Request, res: Response) => {
     // Old desktop clients omit `mode` entirely; only the web signin sends
     // mode:'signin', so this guard doesn't affect first-time desktop setup.
     if (mode === 'signin') {
+      // Counts toward the IP's failed sign-ins so number-guessing gets blocked too.
+      noteFailedSignIn(req, mobile.trim());
       res.status(404).json({ success: false, error: 'No account found for this mobile number. Please register your store first.' });
       return;
+    }
+
+    // New account — basic validation, then the per-IP creation limit (branch codes are already
+    // single-use and owner-issued, so they skip the limit).
+    if (!autoApprove) {
+      if (!validMobile(mobile)) {
+        res.status(400).json({ success: false, error: 'Enter a valid mobile number (10–15 digits).' });
+        return;
+      }
+      if (isRegister && (!password || String(password).length < 6)) {
+        res.status(400).json({ success: false, error: 'Password must be at least 6 characters.' });
+        return;
+      }
+      if (!allowAccountCreation(req, res)) return;
     }
 
     // New registration
@@ -154,6 +177,7 @@ router.post('/register-business', async (req: Request, res: Response) => {
         branch_code:        branchCode?.trim() || '',
       } as any,
     });
+    if (!autoApprove) noteAccountCreated(req);
 
     res.status(201).json({
       success:         true,

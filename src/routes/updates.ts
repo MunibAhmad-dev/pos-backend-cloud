@@ -5,6 +5,7 @@
 import { Router, Request, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import prisma from '../db';
 import { RELEASES_DIR } from '../lib/releases';
 
@@ -20,6 +21,29 @@ function isNewer(current: string, candidate: string): boolean {
     if ((n[i] ?? 0) < (c[i] ?? 0)) return false;
   }
   return false;
+}
+
+/**
+ * SHA-256 + byte size of an installer hosted on this server, so the POS can refuse to install a
+ * truncated or altered download. Computed from the file on disk (no DB column needed) and cached
+ * until the file changes. Returns null for installers hosted elsewhere.
+ */
+const hashCache = new Map<string, { key: string; sha256: string; size: number }>();
+async function localInstallerHash(downloadUrl: string): Promise<{ sha256: string; size: number } | null> {
+  const m = String(downloadUrl || '').match(/\/api\/updates\/download\/([^/?#]+)/);
+  if (!m) return null;
+  const full = path.resolve(RELEASES_DIR, path.basename(decodeURIComponent(m[1])));
+  if (!full.startsWith(path.resolve(RELEASES_DIR)) || !fs.existsSync(full)) return null;
+  const st = fs.statSync(full);
+  const key = `${st.size}:${st.mtimeMs}`;
+  const hit = hashCache.get(full);
+  if (hit && hit.key === key) return { sha256: hit.sha256, size: hit.size };
+  const sha256 = await new Promise<string>((resolve, reject) => {
+    const h = crypto.createHash('sha256');
+    fs.createReadStream(full).on('data', (c) => h.update(c)).on('end', () => resolve(h.digest('hex'))).on('error', reject);
+  });
+  hashCache.set(full, { key, sha256, size: st.size });
+  return { sha256, size: st.size };
 }
 
 /**
@@ -44,6 +68,8 @@ router.get('/latest', async (req: Request, res: Response) => {
   }
 
   const update_available = isNewer(currentVersion, latest.version);
+  let integrity: { sha256: string; size: number } | null = null;
+  if (update_available) { try { integrity = await localInstallerHash(latest.download_url); } catch { integrity = null; } }
 
   res.json({
     success: true,
@@ -54,7 +80,8 @@ router.get('/latest', async (req: Request, res: Response) => {
       channel:      latest.channel,
       changelog:    latest.changelog,
       download_url: latest.download_url,
-      file_size:    latest.file_size,
+      file_size:    integrity?.size ?? latest.file_size,
+      sha256:       integrity?.sha256 ?? null,
       is_mandatory: latest.is_mandatory,
       published_at: latest.created_at,
     },

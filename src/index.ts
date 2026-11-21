@@ -35,6 +35,7 @@ import manufacturingRoutes from './routes/manufacturing'; // Factory ERP (Air Co
 import vendorRoutes       from './routes/vendors';
 import customerRoutes     from './routes/customers';
 import mercyRoutes        from './routes/mercy';       // Mercy College of Nursing admission portal
+import { startDuplicateSaleItemJob } from './lib/saleItemDedupe';
 
 // ─── Startup env validation ───────────────────────────────────────────────────
 if (!process.env.JWT_SECRET) {
@@ -191,6 +192,7 @@ app.use((err: Error, req: express.Request, res: express.Response, _next: express
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
+  startDuplicateSaleItemJob(); // only when AUTO_DEDUPE_SALE_ITEMS=true
   console.log(`\n┌─────────────────────────────────────────────┐`);
   console.log(`│   OsaTech POS Cloud Backend                 │`);
   console.log(`│   Running on http://localhost:${PORT}           │`);

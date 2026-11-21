@@ -2,6 +2,10 @@ import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import bcrypt from 'bcryptjs';
 import prisma from '../../db';
+import {
+  rejectBlockedIp, allowAccountCreation, noteAccountCreated,
+  allowSignInAttempt, noteFailedSignIn, noteSuccessfulSignIn, validMobile,
+} from '../../middleware/accountGuard';
 
 const router = Router();
 
@@ -14,7 +18,7 @@ const router = Router();
  * existing api_key (so reinstalling the app on the same phone number just
  * logs back in instead of erroring).
  */
-router.post('/register', async (req: Request, res: Response) => {
+router.post('/register', rejectBlockedIp, async (req: Request, res: Response) => {
   const { mobile, password, company_name, device_fingerprint, app_version } = req.body as Record<string, string>;
   if (!mobile || !password) {
     res.status(400).json({ success: false, error: 'mobile and password are required' });
@@ -23,11 +27,14 @@ router.post('/register', async (req: Request, res: Response) => {
 
   const existing = await prisma.manufacturingInstance.findUnique({ where: { mobile: mobile.trim() } });
   if (existing) {
+    if (!allowSignInAttempt(req, res, mobile.trim())) return;
     const ok = await bcrypt.compare(password, existing.password_hash);
     if (!ok) {
+      noteFailedSignIn(req, mobile.trim());
       res.status(401).json({ success: false, error: 'This mobile number is already registered with a different password' });
       return;
     }
+    noteSuccessfulSignIn(mobile.trim());
     const updated = await prisma.manufacturingInstance.update({
       where: { mobile: mobile.trim() },
       data: { device_fingerprint: device_fingerprint || undefined, app_version: app_version || undefined, last_seen: new Date() },
@@ -40,6 +47,16 @@ router.post('/register', async (req: Request, res: Response) => {
     return;
   }
 
+  if (!validMobile(mobile)) {
+    res.status(400).json({ success: false, error: 'Enter a valid mobile number (10–15 digits).' });
+    return;
+  }
+  if (String(password).length < 6) {
+    res.status(400).json({ success: false, error: 'Password must be at least 6 characters.' });
+    return;
+  }
+  if (!allowAccountCreation(req, res)) return;
+
   const password_hash = await bcrypt.hash(password, 10);
   const api_key = uuidv4();
   const created = await prisma.manufacturingInstance.create({
@@ -48,6 +65,7 @@ router.post('/register', async (req: Request, res: Response) => {
       api_key, device_fingerprint: device_fingerprint || '', app_version: app_version || '',
     },
   });
+  noteAccountCreated(req);
 
   res.status(201).json({
     success: true, api_key: created.api_key, approval_status: created.approval_status,
@@ -62,17 +80,20 @@ router.post('/register', async (req: Request, res: Response) => {
  * Re-authenticates an already-registered installation (e.g. after a reinstall
  * or on a new device) and returns its api_key + current license status.
  */
-router.post('/login', async (req: Request, res: Response) => {
+router.post('/login', rejectBlockedIp, async (req: Request, res: Response) => {
   const { mobile, password } = req.body as Record<string, string>;
   if (!mobile || !password) {
     res.status(400).json({ success: false, error: 'mobile and password are required' });
     return;
   }
+  if (!allowSignInAttempt(req, res, mobile.trim())) return;
   const instance = await prisma.manufacturingInstance.findUnique({ where: { mobile: mobile.trim() } });
   if (!instance || !(await bcrypt.compare(password, instance.password_hash))) {
+    noteFailedSignIn(req, mobile.trim());
     res.status(401).json({ success: false, error: 'Invalid mobile number or password' });
     return;
   }
+  noteSuccessfulSignIn(mobile.trim());
   await prisma.manufacturingInstance.update({ where: { mobile: mobile.trim() }, data: { last_seen: new Date() } });
   res.json({
     success: true, api_key: instance.api_key, approval_status: instance.approval_status,

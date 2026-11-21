@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { Prisma } from '@prisma/client';
 import prisma from '../db';
+import { rejectBlockedIp, allowAccountCreation, noteAccountCreated } from '../middleware/accountGuard';
 import { requireInstance } from '../middleware/instanceAuth';
 import { signMobileToken } from '../middleware/auth';
 import '../types';
@@ -13,7 +14,7 @@ const router = Router();
  *
  * Idempotent — returns existing api_key if mobile already registered.
  */
-router.post('/register', async (req: Request, res: Response) => {
+router.post('/register', rejectBlockedIp, async (req: Request, res: Response) => {
   const {
     instance_id, store_name, owner_name, owner_mobile, owner_email,
     store_address, business_name, license_key, fingerprint, app_version, branch_name,
@@ -101,7 +102,10 @@ router.post('/register', async (req: Request, res: Response) => {
   }
   // ─────────────────────────────────────────────────────────────────────────
 
-  // Genuinely new instance — resolve license if provided
+  // Genuinely new instance — per-IP creation limit first
+  if (!allowAccountCreation(req, res)) return;
+
+  // resolve license if provided
   const api_key = uuidv4();
   let license_plan   = 'none';
   let license_expiry: string | null = null;
@@ -140,6 +144,7 @@ router.post('/register', async (req: Request, res: Response) => {
       active_modules:     activeModulesStr,
     } as any,
   });
+  noteAccountCreated(req);
 
   res.status(201).json({
     success: true,
@@ -277,6 +282,9 @@ router.post('/heartbeat', requireInstance, async (req: Request, res: Response) =
  */
 router.get('/notifications', requireInstance, async (req: Request, res: Response) => {
   const instanceId = req.instance!.instance_id;
+  // ?peek=1 (web POS): recent active notices whether or not a PC already read them, and nothing is
+  // marked read — so the browser can't swallow a popup the shop's PCs still need to show.
+  const peek = String(req.query.peek || '') === '1';
 
   const now = new Date();
 
@@ -285,7 +293,9 @@ router.get('/notifications', requireInstance, async (req: Request, res: Response
     where: {
       is_active: true,
       OR: [{ target_instance_id: null }, { target_instance_id: instanceId }],
-      notification_reads: { none: { instance_id: instanceId } },
+      ...(peek
+        ? { sent_at: { gte: new Date(now.getTime() - 14 * 86_400_000) } }
+        : { notification_reads: { none: { instance_id: instanceId } } }),
       // Show if not expired (expires_at IS NULL means permanent)
       AND: [{ OR: [{ expires_at: null }, { expires_at: { gt: now } }] }],
     },
@@ -295,7 +305,7 @@ router.get('/notifications', requireInstance, async (req: Request, res: Response
   });
 
   // Mark all as read
-  if (notifications.length > 0) {
+  if (!peek && notifications.length > 0) {
     await prisma.notificationRead.createMany({
       data:           notifications.map(n => ({ notification_id: n.id, instance_id: instanceId })),
       skipDuplicates: true,
@@ -338,6 +348,7 @@ router.get('/export', requireInstance, async (req: Request, res: Response) => {
   // this one call monopolizing the process for its entire duration.
   const EXPORT_BATCH_SIZE = 5000;
   const entityMap: Record<string, Map<string, any>> = {};
+  const deletedKeys: Record<string, Set<string>> = {};
   let cursorId = 0;
   let rawEventCount = 0;
   for (;;) {
@@ -356,8 +367,8 @@ router.get('/export', requireInstance, async (req: Request, res: Response) => {
       try { payload = JSON.parse(event.payload); } catch { continue; }
       if (!payload) continue;
       const key = String(payload?.id ?? payload?.barcode ?? event.id);
-      if (event.operation === 'delete') entityMap[type].delete(key);
-      else entityMap[type].set(key, payload);
+      if (event.operation === 'delete') { entityMap[type].delete(key); (deletedKeys[type] ||= new Set()).add(key); }
+      else { entityMap[type].set(key, payload); deletedKeys[type]?.delete(key); }
     }
 
     cursorId = batch[batch.length - 1].id;
@@ -374,15 +385,20 @@ router.get('/export', requireInstance, async (req: Request, res: Response) => {
   const fallbackSales = structured.sale?.length ? [] :
     await prisma.instanceSale.findMany({ where: { instance_id: instanceId }, orderBy: { date_created: 'asc' } });
 
-  // Inventory batches: try from separate events first; if missing, extract from purchase payloads
-  let invBatches: any[] = structured.inventory_batch || [];
-  if (invBatches.length === 0 && (structured.purchase || []).length > 0) {
-    for (const pur of structured.purchase || []) {
-      if (Array.isArray((pur as any).items)) {
-        for (const b of (pur as any).items) invBatches.push(b);
+  // Inventory batches: purchase payloads carry their lines, and batches also arrive as their own events.
+  // Merge both — separate events win, deleted batches stay deleted. (Using only one source dropped every
+  // purchase's lines as soon as a single standalone batch event existed.)
+  const batchById = new Map<string, any>();
+  for (const pur of structured.purchase || []) {
+    if (Array.isArray((pur as any).items)) {
+      for (const b of (pur as any).items) {
+        const k = String(b?.id ?? '');
+        if (k && !deletedKeys.inventory_batch?.has(k)) batchById.set(k, b);
       }
     }
   }
+  for (const b of structured.inventory_batch || []) batchById.set(String(b?.id), b);
+  const invBatches: any[] = Array.from(batchById.values());
 
   // Settings: use synced settings_info if available, otherwise use instance fields
   const settingsRow: any = (structured.settings || [])[0] || null;
@@ -415,6 +431,7 @@ router.get('/export', requireInstance, async (req: Request, res: Response) => {
     // ── Purchases & Stock ────────────────────────────────────────────────────
     purchases:              structured.purchase         || [],
     inventory_batches:      invBatches,
+    product_batches:        structured.product_batch    || [],
     purchase_returns:       structured.purchase_return  || [],
     purchase_return_items:  structured.purchase_return_item || [],
     stock_adjustments:      structured.stock_adjustment || [],
@@ -429,9 +446,22 @@ router.get('/export', requireInstance, async (req: Request, res: Response) => {
     financial_transactions: structured.financial_transaction || [],
     // ── Warranty ────────────────────────────────────────────────────────────
     warranty_claims:        structured.warranty_claim || [],
-    // ── Custom Bills (desktop stores as vendor_khata / vendor_khata_payment) ──
-    vendor_khatas:          structured.vendor_khata || [],
-    vendor_khata_payments:  structured.vendor_khata_payment || [],
+    // ── Custom Bills, cheques, route book, DMS — keyed by the desktop's table names. A cloud restore
+    //    wipes local tables first, so anything missing here was lost on "Fetch All Data from Cloud". ──
+    vendor_khata:              structured.vendor_khata || [],
+    vendor_khatas:             structured.vendor_khata || [],   // older desktop builds
+    vendor_khata_payments:     structured.vendor_khata_payment || [],
+    customer_khata:            structured.customer_khata || [],
+    customer_khata_payments:   structured.customer_khata_payment || [],
+    vendor_cheques:            structured.vendor_cheque || [],
+    customer_locations:        structured.customer_location || [],
+    customer_location_members: structured.customer_location_member || [],
+    dms_companies:             structured.dms_company || [],
+    dms_orders:                structured.dms_order || [],
+    dms_recoveries:            structured.dms_recovery || [],
+    dms_partnerships:          structured.dms_partnership || [],
+    dms_partner_drawings:      structured.dms_partner_drawing || [],
+    customer_product_prices:   structured.customer_product_price || [],
     // ── History ─────────────────────────────────────────────────────────────
     entity_history:         structured.entity_history || [],
     // ── Meta ────────────────────────────────────────────────────────────────
@@ -948,10 +978,10 @@ const CATEGORY_ENTITY_TYPES: Record<string, string[]> = {
   sales:             ['sale', 'sale_item', 'sale_return', 'sale_return_item', 'customer_payment'],
   customer_ledger:   ['customer_payment'],
   customer_balances: ['customer_payment'],
-  customers:         ['customer', 'customer_payment'],
+  customers:         ['customer', 'customer_payment', 'customer_product_price'],
   khata:             ['customer_khata', 'customer_khata_payment'],
   route_book:        ['customer_location', 'customer_location_member'],
-  products:          ['product', 'inventory_batch'],
+  products:          ['product', 'inventory_batch', 'product_batch'],
   stock_only:        [],
   vendors_purchases: ['vendor', 'purchase', 'purchase_return', 'purchase_return_item', 'inventory_batch', 'vendor_payment', 'vendor_khata', 'vendor_khata_payment'],
   expenses:          ['expense'],

@@ -5,3 +5,6 @@ dist/
 *.db-wal
 .env
 *.log
+
+# IP blocks written by middleware/accountGuard.ts
+data/

@@ -7,7 +7,10 @@ import multer from 'multer';
 import { Prisma } from '@prisma/client';
 import prisma from '../db';
 import { requireAdmin } from '../middleware/auth';
+import { listIpBlocks, unblockIp } from '../middleware/accountGuard';
 import { RELEASES_DIR } from '../lib/releases';
+import { scanShop, fixShop } from '../lib/saleItemDedupe';
+import { logAction } from './admins';
 import '../types';
 
 // ─── Release installer upload (multipart) ───────────────────────────────────
@@ -337,6 +340,7 @@ const ENTITY_TO_TABLE: Record<string, string> = {
   // Purchases & Stock
   purchase:              'purchases',
   inventory_batch:       'inventory_batches',
+  product_batch:         'product_batches',
   purchase_return:       'purchase_returns',
   purchase_return_item:  'purchase_return_items',
   stock_adjustment:      'stock_adjustments',
@@ -1385,7 +1389,7 @@ router.get('/export-all', async (req: Request, res: Response) => {
  * The admin can call this for each category and download the result.
  */
 const CATEGORY_ENTITIES: Record<string, string[]> = {
-  products:  ['product', 'inventory_batch', 'stock_adjustment'],
+  products:  ['product', 'inventory_batch', 'product_batch', 'stock_adjustment'],
   sales:     ['sale', 'sale_item'],
   customers: ['customer'],
   vendors:   ['vendor'],
@@ -1399,7 +1403,7 @@ const CATEGORY_ENTITIES: Record<string, string[]> = {
 
 // entity_type → table name mapping (singular → plural)
 const ENTITY_TABLE: Record<string, string> = {
-  product: 'products', inventory_batch: 'inventory_batches', stock_adjustment: 'stock_adjustments',
+  product: 'products', inventory_batch: 'inventory_batches', product_batch: 'product_batches', stock_adjustment: 'stock_adjustments',
   sale: 'sales', sale_item: 'sale_items',
   customer: 'customers', vendor: 'vendors', employee: 'employees', employee_advance: 'employee_advances',
   purchase: 'purchases', purchase_return: 'purchase_returns', purchase_return_item: 'purchase_return_items',
@@ -3531,5 +3535,58 @@ router.delete('/instances/:id/deletion-log', requireAdmin, async (req: Request, 
 });
 
 // Multi-device is handled via shared cloud credentials — no separate shop accounts needed.
+
+// ── Abuse protection: blocked IPs ────────────────────────────────────────────
+// GET  /api/admin/ip-blocks        → IPs currently blocked from signing up / signing in
+// DELETE /api/admin/ip-blocks/:ip  → lift a block (e.g. a real shop on a shared network)
+router.get('/ip-blocks', requireAdmin, (_req: Request, res: Response) => {
+  res.json({ success: true, data: listIpBlocks() });
+});
+router.delete('/ip-blocks/:ip', requireAdmin, (req: Request, res: Response) => {
+  unblockIp(String(req.params.ip));
+  res.json({ success: true });
+});
+
+// ── Duplicated sale lines (old desktop edit-sale bug) — same rules as desktop dedupeSaleItems() ──
+// GET  /api/admin/maintenance/duplicate-sale-items[?instance_id=]  → dry run: what would be removed
+// POST /api/admin/maintenance/duplicate-sale-items/fix {instance_id | all:true} → append delete events
+router.get('/maintenance/duplicate-sale-items', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const only = req.query.instance_id ? String(req.query.instance_id) : null;
+    const shops = await prisma.instance.findMany({
+      where: only ? { instance_id: only } : {},
+      select: { instance_id: true, store_name: true },
+    });
+    const reports = [];
+    for (const sh of shops) {
+      const { all, ...r } = await scanShop(sh.instance_id, sh.store_name || '');
+      void all;
+      if (only || r.lines_to_remove > 0) reports.push(r);
+    }
+    reports.sort((a, b) => b.extra_cogs - a.extra_cogs);
+    res.json({ success: true, data: {
+      shops_scanned: shops.length, shops_affected: reports.filter(r => r.lines_to_remove > 0).length,
+      lines_to_remove: reports.reduce((a, r) => a + r.lines_to_remove, 0), reports,
+    } });
+  } catch (e: any) { res.status(500).json({ success: false, error: e?.message || 'Scan failed' }); }
+});
+router.post('/maintenance/duplicate-sale-items/fix', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { instance_id, all } = req.body || {};
+    if (!instance_id && all !== true) return res.status(400).json({ success: false, error: 'Pass instance_id, or all: true' });
+    const shops = await prisma.instance.findMany({
+      where: all === true ? {} : { instance_id: String(instance_id) },
+      select: { instance_id: true, store_name: true },
+    });
+    const results = [];
+    for (const sh of shops) {
+      const r = await fixShop(sh.instance_id);
+      if (r.removed) results.push({ instance_id: sh.instance_id, store_name: sh.store_name, ...r });
+    }
+    const removed = results.reduce((a, r) => a + r.removed, 0);
+    await logAction(req, 'fix_duplicate_sale_items', 'instance', all === true ? 'all' : String(instance_id), { removed, shops: results.length });
+    res.json({ success: true, data: { removed, shops_fixed: results.length, results } });
+  } catch (e: any) { res.status(500).json({ success: false, error: e?.message || 'Fix failed' }); }
+});
 
 export default router;
