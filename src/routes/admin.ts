@@ -372,6 +372,7 @@ const ENTITY_TO_TABLE: Record<string, string> = {
   agreement:           'agreements',
   // POS Users
   pos_user:            'pos_users',
+  activity_log:        'activity_log',
 };
 
 async function buildExportPayload(instanceId: string) {
@@ -2359,23 +2360,87 @@ router.get('/instances/:id/users', async (req: Request, res: Response) => {
   const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
   if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
 
-  const raw = await parseEntityFromSync(req.params.id, 'pos_user');
-  // Keep only the latest record per user id (upsert semantics)
-  const byId = new Map<number, any>();
-  for (const u of raw.sort((a: any, b: any) => new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime())) {
-    byId.set(u.id, u);
+  // Merge every event per user id in order: older POS versions sent partial rows
+  // ({ id, is_active }) which used to replace the whole account and lose the name.
+  const events = await prisma.syncEvent.findMany({
+    where: { instance_id: req.params.id, entity_type: 'pos_user' },
+    orderBy: { id: 'asc' },
+    select: { operation: true, payload: true, received_at: true },
+  });
+  const byId = new Map<string, any>();
+  for (const ev of events) {
+    let p: any; try { p = JSON.parse(ev.payload); } catch { continue; }
+    if (!p || p.id == null) continue;
+    const key = String(p.id);
+    if (ev.operation === 'delete') { byId.delete(key); continue; }
+    byId.set(key, { ...(byId.get(key) || {}), ...p, _synced_at: ev.received_at });
   }
-  const users = [...byId.values()].map((u: any) => ({
-    id:         u.id,
-    full_name:  u.full_name,
-    username:   u.username,
-    role:       u.role,
-    is_active:  u.is_active,
-    created_at: u.created_at,
-    password:   u.password_enc ? decryptUserPassword(u.password_enc) : '—',
-  }));
 
-  res.json({ success: true, data: users });
+  // Activity totals per person (from the synced activity log).
+  const stats = await prisma.$queryRaw<any[]>(Prisma.sql`
+    SELECT (payload::jsonb)->>'user_name' AS name,
+           COUNT(*)::int AS actions,
+           MAX((payload::jsonb)->>'at') AS last_at,
+           COUNT(*) FILTER (WHERE LEFT((payload::jsonb)->>'at', 10) = TO_CHAR(NOW() AT TIME ZONE 'Asia/Karachi', 'YYYY-MM-DD'))::int AS today,
+           COUNT(*) FILTER (WHERE (payload::jsonb)->>'action' = 'sale.create')::int AS sales
+    FROM sync_events
+    WHERE instance_id = ${req.params.id} AND entity_type = 'activity_log' AND operation <> 'delete'
+    GROUP BY 1`).catch(() => [] as any[]);
+  const statByName = new Map(stats.map((r: any) => [r.name, r]));
+
+  const users = [...byId.values()].filter(u => u.username || u.full_name).map((u: any) => {
+    const st: any = statByName.get(u.full_name) || {};
+    return {
+      id:            u.id,
+      full_name:     u.full_name || '(unnamed)',
+      username:      u.username || '',
+      role:          u.role || 'staff',
+      is_active:     u.is_active ?? 1,
+      created_at:    u.created_at,
+      last_login_at: u.last_login_at || null,
+      password:      u.password_enc ? decryptUserPassword(u.password_enc) : '',
+      actions:       st.actions || 0,
+      actions_today: st.today || 0,
+      sales_made:    st.sales || 0,
+      last_active:   st.last_at || null,
+    };
+  }).sort((a, b) => Number(b.is_active) - Number(a.is_active) || String(a.full_name).localeCompare(String(b.full_name)));
+
+  // People who appear in the log but have no account row (the owner, or a deleted account).
+  const known = new Set(users.map(u => u.full_name));
+  const others = stats.filter((r: any) => r.name && !known.has(r.name))
+    .map((r: any) => ({ name: r.name, actions: r.actions, actions_today: r.today, sales_made: r.sales, last_active: r.last_at }));
+
+  res.json({ success: true, data: users, others });
+});
+
+// Staff activity feed — who sold, edited, paid or changed what (synced from each PC).
+router.get('/instances/:id/activity', async (req: Request, res: Response) => {
+  const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
+  if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+  const offset = Math.max(0, Number(req.query.offset) || 0);
+  const user = typeof req.query.user === 'string' && req.query.user.trim() ? req.query.user.trim() : null;
+  const group = typeof req.query.group === 'string' ? req.query.group : '';
+  const PREFIX: Record<string, string[]> = {
+    sales: ['sale.'], payments: ['payment.', 'vendor_payment.'], purchases: ['purchase.'],
+    stock: ['product.', 'stock.'], expenses: ['expense.'], logins: ['auth.', 'user.'],
+  };
+  const prefixes = PREFIX[group] || [];
+  const userSql = user ? Prisma.sql`AND (payload::jsonb)->>'user_name' = ${user}` : Prisma.empty;
+  const groupSql = prefixes.length
+    ? Prisma.sql`AND (${Prisma.join(prefixes.map(px => Prisma.sql`(payload::jsonb)->>'action' LIKE ${px + '%'}`), ' OR ')})`
+    : Prisma.empty;
+  const base = Prisma.sql`
+    FROM (
+      SELECT DISTINCT ON ((payload::jsonb)->>'id') payload::jsonb AS p
+      FROM sync_events
+      WHERE instance_id = ${req.params.id} AND entity_type = 'activity_log' AND operation <> 'delete' ${userSql} ${groupSql}
+      ORDER BY (payload::jsonb)->>'id', id DESC
+    ) x`;
+  const rows = await prisma.$queryRaw<any[]>(Prisma.sql`SELECT p ${base} ORDER BY p->>'at' DESC NULLS LAST LIMIT ${limit} OFFSET ${offset}`).catch(() => [] as any[]);
+  const totalRow = await prisma.$queryRaw<any[]>(Prisma.sql`SELECT COUNT(*)::int AS n ${base}`).catch(() => [{ n: 0 }]);
+  res.json({ success: true, data: rows.map((r: any) => r.p), total: totalRow[0]?.n || 0 });
 });
 
 // ── Analytics ─────────────────────────────────────────────────────────────────
