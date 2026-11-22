@@ -3703,6 +3703,29 @@ router.get('/maintenance/lost-sale-items', requireAdmin, async (req: Request, re
     } });
   } catch (e: any) { res.status(500).json({ success: false, error: e?.message || 'Scan failed' }); }
 });
+// READ-ONLY: raw sale + sale-line event history of one shop (every create/update/delete, in order, with
+// time received) — downloaded as a file so a lost-lines case can be checked offline before restoring.
+router.get('/maintenance/sale-line-history', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const instanceId = String(req.query.instance_id || '');
+    if (!instanceId) return res.status(400).json({ success: false, error: 'Pass instance_id' });
+    const out: any[] = [];
+    let cursor = 0;
+    for (;;) {
+      const batch = await prisma.syncEvent.findMany({
+        where: { instance_id: instanceId, entity_type: { in: ['sale', 'sale_item', 'sale_return', 'sale_return_item'] }, id: { gt: cursor } },
+        orderBy: { id: 'asc' }, take: 5000,
+        select: { id: true, entity_type: true, operation: true, payload: true, received_at: true },
+      });
+      if (!batch.length) break;
+      out.push(...batch);
+      cursor = batch[batch.length - 1].id;
+      if (batch.length < 5000) break;
+    }
+    res.setHeader('Content-Disposition', `attachment; filename="sale-history-${instanceId}.json"`);
+    res.json({ success: true, instance_id: instanceId, exported_at: new Date().toISOString(), events: out });
+  } catch (e: any) { res.status(500).json({ success: false, error: e?.message || 'Export failed' }); }
+});
 router.post('/maintenance/lost-sale-items/fix', requireAdmin, async (req: Request, res: Response) => {
   try {
     const { instance_id, all } = req.body || {};
@@ -3720,6 +3743,25 @@ router.post('/maintenance/lost-sale-items/fix', requireAdmin, async (req: Reques
     await logAction(req, 'restore_lost_sale_items', 'instance', all === true ? 'all' : String(instance_id), { restored, shops: results.length });
     res.json({ success: true, data: { restored, shops_fixed: results.length, results } });
   } catch (e: any) { res.status(500).json({ success: false, error: e?.message || 'Restore failed' }); }
+});
+// Undo a restore: removes every line that "Restore" put back for this shop (by the restored_lost_line flag).
+router.post('/maintenance/lost-sale-items/undo', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const instanceId = String(req.body?.instance_id || '');
+    if (!instanceId) return res.status(400).json({ success: false, error: 'Pass instance_id' });
+    const restored = await prisma.syncEvent.findMany({
+      where: { instance_id: instanceId, entity_type: 'sale_item', operation: 'create', payload: { contains: '"restored_lost_line":1' } },
+      select: { payload: true },
+    });
+    const ids = [...new Set(restored.map(r => { try { return JSON.parse(r.payload).id; } catch { return null; } }).filter(v => v != null))];
+    for (let i = 0; i < ids.length; i += 1000) {
+      await prisma.syncEvent.createMany({ data: ids.slice(i, i + 1000).map(id => ({
+        instance_id: instanceId, entity_type: 'sale_item', operation: 'delete', payload: JSON.stringify({ id, reason: 'undo_restore_lost_line' }),
+      })) });
+    }
+    await logAction(req, 'undo_restore_lost_sale_items', 'instance', instanceId, { removed: ids.length });
+    res.json({ success: true, data: { removed: ids.length } });
+  } catch (e: any) { res.status(500).json({ success: false, error: e?.message || 'Undo failed' }); }
 });
 
 export default router;

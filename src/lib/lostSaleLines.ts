@@ -36,8 +36,31 @@ export interface LostSale {
 
 type Ev = { id: number; entity_type: string; operation: string; payload: string };
 
-/** Replay sale / sale_item events into current sales, current lines and deleted lines. */
-export function replayEvents(events: Ev[], st = { sales: new Map<string, any>(), items: new Map<string, any>(), deleted: new Map<string, { payload: any; firstSeen: number }>(), firstSeen: new Map<string, number>() }) {
+const targetOf = (s: any) => (num(s?.subtotal) > 0 ? num(s.subtotal) : num(s?.total) + num(s?.discount) - num(s?.tax));
+
+function newState() {
+  return {
+    sales: new Map<string, any>(),
+    items: new Map<string, any>(),
+    deleted: new Map<string, { payload: any; firstSeen: number }>(),
+    firstSeen: new Map<string, number>(),
+    bySale: new Map<string, Set<string>>(),                  // sale id → ids of its current lines
+    lastComplete: new Map<string, Map<string, any>>(),       // sale id → last set of lines that added up to the bill
+  };
+}
+
+/** Replay sale / sale_item events into current sales, current lines, deleted lines, and — for every
+ *  sale — the last moment its lines added up exactly to its subtotal (the last complete version). */
+export function replayEvents(events: Ev[], st = newState()) {
+  const link = (saleId: string, k: string) => { if (!st.bySale.has(saleId)) st.bySale.set(saleId, new Set()); st.bySale.get(saleId)!.add(k); };
+  const unlink = (saleId: string, k: string) => { st.bySale.get(saleId)?.delete(k); };
+  const snapshot = (saleId: string) => {
+    const sale = st.sales.get(saleId); const ids = st.bySale.get(saleId);
+    if (!sale || !ids?.size) return;
+    let sum = 0; for (const k of ids) { const it = st.items.get(k); sum += num(it?.quantity) * num(it?.price); }
+    const target = targetOf(sale);
+    if (target > 0 && Math.abs(sum - target) <= 1) st.lastComplete.set(saleId, new Map([...ids].map(k => [k, { ...st.items.get(k) }])));
+  };
   for (const ev of events) {
     let p: any;
     try { p = JSON.parse(ev.payload); } catch { continue; }
@@ -45,17 +68,24 @@ export function replayEvents(events: Ev[], st = { sales: new Map<string, any>(),
     const k = String(p.id);
     if (ev.entity_type === 'sale') {
       if (ev.operation === 'delete') st.sales.delete(k); else st.sales.set(k, { ...(st.sales.get(k) || {}), ...p });
+      snapshot(k);
       continue;
     }
     if (ev.entity_type !== 'sale_item') continue;
+    const prev = st.items.get(k);
+    const prevSale = prev?.sale_id != null ? String(prev.sale_id) : null;
     if (ev.operation === 'delete') {
-      const last = st.items.get(k);
-      if (last) st.deleted.set(k, { payload: last, firstSeen: st.firstSeen.get(k) ?? ev.id });
+      if (prev) st.deleted.set(k, { payload: prev, firstSeen: st.firstSeen.get(k) ?? ev.id });
       st.items.delete(k);
+      if (prevSale) { unlink(prevSale, k); snapshot(prevSale); }
     } else {
       if (!st.firstSeen.has(k)) st.firstSeen.set(k, ev.id);
-      st.items.set(k, { ...(st.items.get(k) || st.deleted.get(k)?.payload || {}), ...p });
+      const next = { ...(prev || st.deleted.get(k)?.payload || {}), ...p };
+      st.items.set(k, next);
       st.deleted.delete(k);
+      const nowSale = next.sale_id != null ? String(next.sale_id) : null;
+      if (prevSale && prevSale !== nowSale) { unlink(prevSale, k); snapshot(prevSale); }
+      if (nowSale) { link(nowSale, k); snapshot(nowSale); }
     }
   }
   return st;
@@ -75,11 +105,12 @@ async function loadHistory(instanceId: string) {
     cursor = batch[batch.length - 1].id;
     if (batch.length < 5000) break;
   }
-  return st ?? replayEvents([]);
+  return st ?? newState();
 }
 
 /** Pure matching — exported for tests. */
-export function findLostLines(sales: any[], items: any[], deleted: Array<{ payload: any; firstSeen: number }>): LostSale[] {
+export function findLostLines(sales: any[], items: any[], deleted: Array<{ payload: any; firstSeen: number }>, lastComplete?: Map<string, Map<string, any>>): LostSale[] {
+  const present = new Set(items.map(it => String(it?.id)));
   const linesBySale = new Map<string, number>();
   for (const it of items) {
     const k = String(it?.sale_id ?? '');
@@ -100,8 +131,17 @@ export function findLostLines(sales: any[], items: any[], deleted: Array<{ paylo
     const have = linesBySale.get(String(s.id)) || 0;
     const gap = target - have;
     if (gap <= 1) continue;
-    const cands = (delBySale.get(String(s.id)) || []).sort((a, b) => b.firstSeen - a.firstSeen);
-    let sum = 0; let pick: any[] | null = null;
+    let pick: any[] | null = null;
+    // 1. Put back the last complete version of the bill: its lines that are gone now, if they fill the gap exactly.
+    const snap = lastComplete?.get(String(s.id));
+    if (snap) {
+      const back = [...snap.values()].filter(r => !present.has(String(r.id)));
+      const backSum = back.reduce((a, r) => a + num(r.quantity) * num(r.price), 0);
+      if (back.length && Math.abs(backSum - gap) <= 1) pick = back;
+    }
+    // 2. Otherwise the newest deleted lines of the bill that fill the gap exactly.
+    const cands = pick ? [] : (delBySale.get(String(s.id)) || []).sort((a, b) => b.firstSeen - a.firstSeen);
+    let sum = 0;
     for (let i = 0; i < cands.length; i++) {
       sum += num(cands[i].payload.quantity) * num(cands[i].payload.price);
       if (Math.abs(sum - gap) <= 1) { pick = cands.slice(0, i + 1).map(c => c.payload); break; }
@@ -120,7 +160,7 @@ export function findLostLines(sales: any[], items: any[], deleted: Array<{ paylo
 
 export async function scanLostLines(instanceId: string, storeName = '') {
   const h = await loadHistory(instanceId);
-  const all = findLostLines([...h.sales.values()], [...h.items.values()], [...h.deleted.values()]);
+  const all = findLostLines([...h.sales.values()], [...h.items.values()], [...h.deleted.values()], h.lastComplete);
   const ok = all.filter(x => x.exact);
   return {
     instance_id: instanceId, store_name: storeName,
