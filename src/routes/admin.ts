@@ -373,6 +373,7 @@ const ENTITY_TO_TABLE: Record<string, string> = {
   // POS Users
   pos_user:            'pos_users',
   activity_log:        'activity_log',
+  warranty_claim:      'warranty_claims',
 };
 
 async function buildExportPayload(instanceId: string) {
@@ -2412,6 +2413,30 @@ router.get('/instances/:id/users', async (req: Request, res: Response) => {
     .map((r: any) => ({ name: r.name, actions: r.actions, actions_today: r.today, sales_made: r.sales, last_active: r.last_at }));
 
   res.json({ success: true, data: users, others });
+});
+
+// Warranty claims synced from the shop's PCs (latest state per claim).
+router.get('/instances/:id/warranty', async (req: Request, res: Response) => {
+  const exists = await prisma.instance.findUnique({ where: { instance_id: req.params.id }, select: { id: true } });
+  if (!exists) { res.status(404).json({ success: false, error: 'Instance not found' }); return; }
+  const events = await prisma.syncEvent.findMany({
+    where: { instance_id: req.params.id, entity_type: 'warranty_claim' }, orderBy: { id: 'asc' }, select: { operation: true, payload: true },
+  });
+  const byId = new Map<string, any>();
+  for (const ev of events) {
+    let p: any; try { p = JSON.parse(ev.payload); } catch { continue; }
+    if (!p || p.id == null) continue;
+    if (ev.operation === 'delete') { byId.delete(String(p.id)); continue; }
+    byId.set(String(p.id), { ...(byId.get(String(p.id)) || {}), ...p });
+  }
+  const claims = [...byId.values()].sort((a, b) => String(b.received_date || b.date_created || '').localeCompare(String(a.received_date || a.date_created || '')));
+  const stats = {
+    inGodown: claims.filter(c => c.status === 'in_godown').length,
+    withCompany: claims.filter(c => c.status === 'sent_to_company').length,
+    readyToGive: claims.filter(c => c.status === 'replacement_received').length,
+    closed: claims.filter(c => c.status === 'closed').length,
+  };
+  res.json({ success: true, data: claims, stats });
 });
 
 // Staff activity feed — who sold, edited, paid or changed what (synced from each PC).
