@@ -57,6 +57,8 @@ router.post('/', requireInstance, async (req: Request, res: Response) => {
   const ID_RE = `"id":"?([^",}]*)`;
   const cloudDeleted = new Map<string, number>();   // `${type}:${id}` → latest delete event id
   const resyncTypes = [...new Set(items.filter(i => i?.payload && (i.payload as any)._resync && i.operation !== 'delete').map(i => i.entity_type))];
+  // Older PCs (≤2.57) don't flag their resyncs, so sale lines are always checked (see the sale_item rule below).
+  if (items.some(i => i?.entity_type === 'sale_item' && i.operation !== 'delete') && !resyncTypes.includes('sale_item')) resyncTypes.push('sale_item');
   if (resyncTypes.length) {
     try {
       const rows = await prisma.$queryRaw<Array<{ entity_type: string; eid: string | null; did: number }>>(Prisma.sql`
@@ -81,6 +83,34 @@ router.post('/', requireInstance, async (req: Request, res: Response) => {
         const isResync = !!(item.payload as any)?._resync;
         const cleanPayload: Record<string, any> = isResync ? (({ _resync, ...rest }: any) => rest)(item.payload) : (item.payload || {});
         // Resync snapshot of a row the cloud deleted (and nobody re-created since) → drop it.
+        // Sale lines from older PCs (no _resync flag): drop only when it is the SAME line coming back
+        // (same bill, product, qty and price as the deleted one) — a genuinely new line that happens to
+        // reuse the id belongs to another bill and is kept. Lines put back by support carry restored_lost_line.
+        const unflaggedLine = !isResync && item.entity_type === 'sale_item' && item.operation !== 'delete' && !cleanPayload.restored_lost_line;
+        if (unflaggedLine && cleanPayload.id != null) {
+          const eid = String(cleanPayload.id);
+          const did = cloudDeleted.get(`sale_item:${eid}`);
+          if (did) {
+            const [prev] = await prisma.$queryRaw<Array<{ payload: string; operation: string }>>(Prisma.sql`
+              SELECT payload, operation FROM sync_events
+              WHERE  instance_id = ${inst.instance_id} AND entity_type = 'sale_item' AND substring(payload from ${ID_RE}) = ${eid}
+              ORDER  BY id DESC LIMIT 2
+            `);
+            // latest event is the delete itself → compare with the version before it
+            if (prev?.operation === 'delete') {
+              const [before] = await prisma.$queryRaw<Array<{ payload: string }>>(Prisma.sql`
+                SELECT payload FROM sync_events
+                WHERE  instance_id = ${inst.instance_id} AND entity_type = 'sale_item' AND id < ${did}
+                  AND  operation <> 'delete' AND substring(payload from ${ID_RE}) = ${eid}
+                ORDER  BY id DESC LIMIT 1
+              `);
+              let old: any = null; try { old = before ? JSON.parse(before.payload) : null; } catch { old = null; }
+              const same = old && String(old.sale_id) === String(cleanPayload.sale_id) && String(old.product_id ?? '') === String(cleanPayload.product_id ?? '')
+                && Number(old.quantity) === Number(cleanPayload.quantity) && Number(old.price) === Number(cleanPayload.price);
+              if (same) { results.push({ local_id: item.local_id, success: true }); synced++; continue; }
+            }
+          }
+        }
         if (isResync && item.operation !== 'delete' && cleanPayload.id != null) {
           const eid = String(cleanPayload.id);
           const did = cloudDeleted.get(`${item.entity_type}:${eid}`);

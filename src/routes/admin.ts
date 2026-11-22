@@ -10,7 +10,7 @@ import { requireAdmin } from '../middleware/auth';
 import { listIpBlocks, unblockIp } from '../middleware/accountGuard';
 import { RELEASES_DIR } from '../lib/releases';
 import { scanShop, fixShop } from '../lib/saleItemDedupe';
-import { scanLostLines, restoreLostLines } from '../lib/lostSaleLines';
+import { scanLostLines, restoreLostLines, previewOrApplyFix } from '../lib/lostSaleLines';
 import { logAction } from './admins';
 import '../types';
 
@@ -3762,6 +3762,18 @@ router.post('/maintenance/lost-sale-items/undo', requireAdmin, async (req: Reque
     await logAction(req, 'undo_restore_lost_sale_items', 'instance', instanceId, { removed: ids.length });
     res.json({ success: true, data: { removed: ids.length } });
   } catch (e: any) { res.status(500).json({ success: false, error: e?.message || 'Undo failed' }); }
+});
+
+// Hand-checked bill-line correction for one shop: { instance_id, fix: { creates, updates, deletes, allow_mismatch }, apply }
+// apply=false → preview only (nothing written). See previewOrApplyFix().
+router.post('/maintenance/sale-line-fix', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { instance_id, fix, apply } = req.body || {};
+    if (!instance_id || !fix) return res.status(400).json({ success: false, error: 'Pass instance_id and fix' });
+    const r = await previewOrApplyFix(String(instance_id), fix, apply === true);
+    if (r.applied) await logAction(req, 'apply_sale_line_fix', 'instance', String(instance_id), { bills: r.bills.map(b => b.sale_id), cost_change: r.cost_change });
+    res.json({ success: true, data: r });
+  } catch (e: any) { res.status(500).json({ success: false, error: e?.message || 'Fix failed' }); }
 });
 
 export default router;

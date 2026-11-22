@@ -91,7 +91,7 @@ export function replayEvents(events: Ev[], st = newState()) {
   return st;
 }
 
-async function loadHistory(instanceId: string) {
+export async function loadHistory(instanceId: string) {
   let st: ReturnType<typeof replayEvents> | undefined;
   let cursor = 0;
   for (;;) {
@@ -189,4 +189,47 @@ export async function restoreLostLines(instanceId: string): Promise<{ restored: 
     });
   }
   return { restored: rows.length, sales: ok.length, cogs: scan.restore_cogs };
+}
+
+export interface SaleLineFix { creates?: any[]; updates?: any[]; deletes?: Array<string | number>; allow_mismatch?: Array<string | number> }
+
+/**
+ * A hand-checked correction for one shop's bill lines (prepared offline from the shop's own backups).
+ * Preview compares every touched bill before/after against the CLOUD's current state; apply refuses
+ * unless every create is missing, every update/delete exists, and every touched bill then adds up to
+ * its subtotal (bills listed in allow_mismatch excepted). Creates/updates carry restored_lost_line so
+ * PCs accept them past their own delete records.
+ */
+export async function previewOrApplyFix(instanceId: string, fix: SaleLineFix, apply: boolean) {
+  const h = await loadHistory(instanceId);
+  const creates = fix.creates || [], updates = fix.updates || [], deletes = (fix.deletes || []).map(String);
+  const allow = new Set((fix.allow_mismatch || []).map(String));
+  const problems: string[] = [];
+  for (const c of creates) if (h.items.has(String(c.id))) problems.push(`create ${c.id}: line already exists in the cloud`);
+  for (const u of updates) if (!h.items.has(String(u.id))) problems.push(`update ${u.id}: line not found in the cloud`);
+  for (const d of deletes) if (!h.items.has(d)) problems.push(`delete ${d}: line not found in the cloud`);
+  // after-state
+  const after = new Map(h.items);
+  for (const d of deletes) after.delete(d);
+  for (const u of updates) after.set(String(u.id), { ...(after.get(String(u.id)) || {}), ...u });
+  for (const c of creates) after.set(String(c.id), c);
+  const touched = new Set<string>([...creates, ...updates].map(r => String(r.sale_id)).concat(deletes.map(d => String(h.items.get(d)?.sale_id ?? ''))).filter(Boolean));
+  const sum = (m: Map<string, any>, sid: string) => { let v = 0, c = 0, n = 0; for (const it of m.values()) if (String(it.sale_id) === sid) { v += num(it.quantity) * num(it.price); c += num(it.quantity) * Math.min(num(it.purchase_price), 1_000_000); n++; } return { value: Math.round(v), cost: Math.round(c), lines: n }; };
+  const bills = [...touched].map(sid => {
+    const sale = h.sales.get(sid);
+    const b = sum(h.items, sid), a = sum(after, sid), target = Math.round(targetOf(sale));
+    const ok = Math.abs(a.value - target) <= 1;
+    if (!sale) problems.push(`bill ${sid}: not found in the cloud`);
+    else if (!ok && !allow.has(sid)) problems.push(`bill ${sid}: lines would add up to ${a.value}, bill is ${target}`);
+    return { sale_id: sid, date: sale?.date_created ?? null, bill: target, before: b, after: a, adds_up: ok };
+  });
+  const result = { problems, bills, cost_change: bills.reduce((t, b) => t + b.after.cost - b.before.cost, 0), applied: false };
+  if (!apply || problems.length) return result;
+  const ev = (operation: string, payload: any) => ({ instance_id: instanceId, entity_type: 'sale_item', operation, payload: JSON.stringify(payload) });
+  await prisma.syncEvent.createMany({ data: [
+    ...deletes.map(d => ev('delete', { id: Number.isFinite(Number(d)) ? Number(d) : d, reason: 'sale_line_fix' })),
+    ...updates.map(u => ev('update', { ...h.items.get(String(u.id)), ...u, restored_lost_line: 1 })),
+    ...creates.map(c => ev('create', { ...c, restored_lost_line: 1 })),
+  ] });
+  return { ...result, applied: true };
 }
