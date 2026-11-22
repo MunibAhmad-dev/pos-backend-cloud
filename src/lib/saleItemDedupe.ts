@@ -149,7 +149,10 @@ export async function fixShop(instanceId: string): Promise<{ removed: number; sa
  * lines since the last run. Same strict rules as the admin button.
  */
 export function startDuplicateSaleItemJob(everyHours = 6) {
-  if (String(process.env.AUTO_DEDUPE_SALE_ITEMS || '').toLowerCase() !== 'true') return;
+  // Switched off for good (23 Nov): judging lines against a bill whose edit is still arriving can
+  // delete the bill's NEW lines (see lostSaleLines.ts). The admin button stays for manual use.
+  if (String(process.env.AUTO_DEDUPE_SALE_ITEMS || '').toLowerCase() === 'true') console.warn('[dedupe] AUTO_DEDUPE_SALE_ITEMS is ignored — automatic sale-line clean-up is disabled');
+  return;
   let since = new Date(Date.now() - everyHours * 3600_000);
   let running = false;
   const run = async () => {

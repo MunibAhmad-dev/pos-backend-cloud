@@ -10,6 +10,7 @@ import { requireAdmin } from '../middleware/auth';
 import { listIpBlocks, unblockIp } from '../middleware/accountGuard';
 import { RELEASES_DIR } from '../lib/releases';
 import { scanShop, fixShop } from '../lib/saleItemDedupe';
+import { scanLostLines, restoreLostLines } from '../lib/lostSaleLines';
 import { logAction } from './admins';
 import '../types';
 
@@ -3677,6 +3678,48 @@ router.post('/maintenance/duplicate-sale-items/fix', requireAdmin, async (req: R
     await logAction(req, 'fix_duplicate_sale_items', 'instance', all === true ? 'all' : String(instance_id), { removed, shops: results.length });
     res.json({ success: true, data: { removed, shops_fixed: results.length, results } });
   } catch (e: any) { res.status(500).json({ success: false, error: e?.message || 'Fix failed' }); }
+});
+
+// ── Sale lines lost to the desktop sync clean-up (2.55–2.57) — see lib/lostSaleLines.ts ──
+// GET  /api/admin/maintenance/lost-sale-items[?instance_id=]  → dry run: bills short of lines + what can be restored
+// POST /api/admin/maintenance/lost-sale-items/fix {instance_id | all:true} → re-create the lines (exact matches only)
+router.get('/maintenance/lost-sale-items', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const only = req.query.instance_id ? String(req.query.instance_id) : null;
+    const shops = await prisma.instance.findMany({
+      where: only ? { instance_id: only } : {},
+      select: { instance_id: true, store_name: true },
+    });
+    const reports = [];
+    for (const sh of shops) {
+      const { all, ...r } = await scanLostLines(sh.instance_id, sh.store_name || '');
+      void all;
+      if (only || r.sales_affected > 0) reports.push(r);
+    }
+    reports.sort((a, b) => b.restore_cogs - a.restore_cogs);
+    res.json({ success: true, data: {
+      shops_scanned: shops.length, shops_affected: reports.filter(r => r.sales_affected > 0).length,
+      lines_to_restore: reports.reduce((a, r) => a + r.lines_to_restore, 0), reports,
+    } });
+  } catch (e: any) { res.status(500).json({ success: false, error: e?.message || 'Scan failed' }); }
+});
+router.post('/maintenance/lost-sale-items/fix', requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { instance_id, all } = req.body || {};
+    if (!instance_id && all !== true) return res.status(400).json({ success: false, error: 'Pass instance_id, or all: true' });
+    const shops = await prisma.instance.findMany({
+      where: all === true ? {} : { instance_id: String(instance_id) },
+      select: { instance_id: true, store_name: true },
+    });
+    const results = [];
+    for (const sh of shops) {
+      const r = await restoreLostLines(sh.instance_id);
+      if (r.restored) results.push({ instance_id: sh.instance_id, store_name: sh.store_name, ...r });
+    }
+    const restored = results.reduce((a, r) => a + r.restored, 0);
+    await logAction(req, 'restore_lost_sale_items', 'instance', all === true ? 'all' : String(instance_id), { restored, shops: results.length });
+    res.json({ success: true, data: { restored, shops_fixed: results.length, results } });
+  } catch (e: any) { res.status(500).json({ success: false, error: e?.message || 'Restore failed' }); }
 });
 
 export default router;
