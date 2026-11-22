@@ -50,6 +50,25 @@ router.post('/', requireInstance, async (req: Request, res: Response) => {
   let hasCustomerEvents = false;
   let hasProductEvents  = false;
 
+  // A full resync re-sends every row a PC still has, flagged _resync. It is a snapshot, not a new
+  // record: if the cloud has since deleted that row (an edited bill's old lines, a removed payment…),
+  // re-sending it must NOT bring it back — that resurrected deleted bill lines on every PC (Khalid,
+  // 23 Nov). Look up which of this batch's types have deletes once per batch.
+  const ID_RE = `"id":"?([^",}]*)`;
+  const cloudDeleted = new Map<string, number>();   // `${type}:${id}` → latest delete event id
+  const resyncTypes = [...new Set(items.filter(i => i?.payload && (i.payload as any)._resync && i.operation !== 'delete').map(i => i.entity_type))];
+  if (resyncTypes.length) {
+    try {
+      const rows = await prisma.$queryRaw<Array<{ entity_type: string; eid: string | null; did: number }>>(Prisma.sql`
+        SELECT entity_type, substring(payload from ${ID_RE}) AS eid, MAX(id)::int AS did
+        FROM   sync_events
+        WHERE  instance_id = ${inst.instance_id} AND operation = 'delete' AND entity_type IN (${Prisma.join(resyncTypes)})
+        GROUP  BY 1, 2
+      `);
+      for (const r of rows) if (r.eid) cloudDeleted.set(`${r.entity_type}:${r.eid}`, Number(r.did));
+    } catch (e: any) { console.warn('[sync] resync delete lookup failed:', e?.message); }
+  }
+
   try {
     // Each item gets its own transaction: inside one shared Postgres transaction a single
     // failing statement aborts every later item and the whole batch 500s, so one bad
@@ -59,8 +78,23 @@ router.post('/', requireInstance, async (req: Request, res: Response) => {
         if (!item || typeof item.entity_type !== 'string' || typeof item.operation !== 'string') {
           throw new Error('entity_type and operation are required');
         }
+        const isResync = !!(item.payload as any)?._resync;
+        const cleanPayload: Record<string, any> = isResync ? (({ _resync, ...rest }: any) => rest)(item.payload) : (item.payload || {});
+        // Resync snapshot of a row the cloud deleted (and nobody re-created since) → drop it.
+        if (isResync && item.operation !== 'delete' && cleanPayload.id != null) {
+          const eid = String(cleanPayload.id);
+          const did = cloudDeleted.get(`${item.entity_type}:${eid}`);
+          if (did) {
+            const [later] = await prisma.$queryRaw<[{ cnt: number }]>(Prisma.sql`
+              SELECT COUNT(*)::int AS cnt FROM sync_events
+              WHERE  instance_id = ${inst.instance_id} AND entity_type = ${item.entity_type}
+                AND  id > ${did} AND operation <> 'delete' AND substring(payload from ${ID_RE}) = ${eid}
+            `);
+            if (!Number(later?.cnt ?? 0)) { results.push({ local_id: item.local_id, success: true }); synced++; continue; }
+          }
+        }
         // A \u0000 escape makes every later `payload::jsonb` cast in the read routes throw.
-        const payloadStr = JSON.stringify(item.payload || {}).replace(/\\u0000/g, '');
+        const payloadStr = JSON.stringify(cleanPayload).replace(/\\u0000/g, '');
 
         await prisma.$transaction(async (tx) => {
           // Skip exact duplicate creates (full-resync re-pushes everything).
@@ -92,7 +126,7 @@ router.post('/', requireInstance, async (req: Request, res: Response) => {
           // instance_sales must follow every sale change (cancel, return, payment status),
           // not only the first create, or admin sales/revenue keep the original state forever.
           if (item.entity_type === 'sale') {
-            const p      = item.payload || {};
+            const p      = cleanPayload;
             const saleNum = Number(p.id ?? p.sale_id);
             if (Number.isSafeInteger(saleNum) && saleNum > 0) {
               const saleId = BigInt(saleNum);
